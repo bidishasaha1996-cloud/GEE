@@ -1,0 +1,82 @@
+// Filter AOI for Gurugram and clip to single geometry
+var gurugram_state = table2.filter(ee.Filter.eq('district', 'GAUTAM BUDDHA NAGAR'));
+var aoi = gurugram_state.geometry(); // Get state geometry
+
+// Filter and clip districts for Gurugram from table2 using district
+var gurugram_districts = table1.filter(ee.Filter.inList('district', [
+  'Gurugram'
+]));
+var clipped_districts = gurugram_districts.map(function(feature) {
+  return feature.intersection(aoi, ee.ErrorMargin(1));
+});
+
+// Display clipped state and districts
+Map.addLayer(aoi, {color: 'black'}, 'Gurugram Boundary');
+Map.addLayer(clipped_districts, {color: 'yellow'}, 'Gurugram District');
+
+// Load Sentinel-2 for true color (using 2024 data for before flood)
+var s2 = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
+  .filterBounds(aoi)
+  .filterDate('2024-06-01', '2024-06-20')
+  .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 20))
+  .select(['B4', 'B3', 'B2'])
+  .median()
+  .clip(aoi);
+
+Map.addLayer(s2, {min: 0, max: 3000, bands: ['B4', 'B3', 'B2']}, 'True Color Before');
+
+// Load Sentinel-1 SAR data
+var collection = ee.ImageCollection('COPERNICUS/S1_GRD')
+  .filterBounds(aoi)
+  .filter(ee.Filter.listContains('transmitterReceiverPolarisation', 'VV'))
+  .select('VV');
+
+// Before and after flood periods
+var before = collection.filterDate('2025-05-01', '2025-06-15').mosaic();
+var after = collection.filterDate('2025-08-31', '2025-09-04').mosaic();
+
+// Clip images
+var before_clip = before.clip(aoi);
+var after_clip = after.clip(aoi);
+
+// Apply smoothening filter
+var before_s = before_clip.focal_median(30, 'circle', 'meters');
+var after_s = after_clip.focal_median(30, 'circle', 'meters');
+
+// Difference for verification
+var difference = after_s.subtract(before_s);
+var flood_extent = difference.lt(-3);
+var flood = flood_extent.updateMask(flood_extent);
+
+var visParams = {
+  bands: ['B1', 'B2', 'B2'],  // Using B2 twice as we only need two classes
+  min: 0,
+  max: 1,
+  palette: ['#00008B', '#00FFFF']  // Dark blue for natural water, cyan for new flooded
+};
+
+// Add layers
+Map.addLayer(before_clip, {min: -30, max: 0}, 'Before Flood');
+Map.addLayer(after_clip, {min: -30, max: 0}, 'After Flood');
+Map.addLayer(difference, {}, 'Difference');
+Map.addLayer(flood, {}, 'Flood');
+
+// Export to Drive
+Export.image.toDrive({
+  image: waterVis.visualize(visParams),
+  description: 'FloodExtent_SeparatedWaterBodies_Gurugram',
+  folder: 'EarthEngineExports',
+  scale: 30,
+  region: aoi,
+  maxPixels: 1e13,
+  fileFormat: 'GeoTIFF'
+});
+
+Export.image.toDrive({
+    image: flood.float(),
+    description: 'FloodExtent_Gurugram',
+    scale: 10,
+    maxPixels: 1e13,
+    region: aoi,
+    CRS: "EPSG:4326"
+});
