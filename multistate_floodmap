@@ -1,0 +1,337 @@
+// Step 1: Inspect table2 to find correct property names and values
+print('Sample of table2:', table2.limit(10)); // Check ST_NM and district values
+print('Unique ST_NM values:', table2.aggregate_array('ST_NM').distinct()); // List all unique state names
+print('Unique district values:', table2.aggregate_array('district').distinct()); // List all unique district names
+
+// Step 2: Filter AOI for Haryana from table2
+var haryana_state = table2.filter(ee.Filter.eq('ST_NM', 'Haryana'));
+
+// Debugging: Print the number of features in filtered state
+print('Filtered Haryana state from table2:', haryana_state.size());
+
+// Step 3: Use fallback dataset (FAO/GAUL/2015/level1) for Haryana
+var fallback_state = ee.FeatureCollection('FAO/GAUL/2015/level1')
+  .filter(ee.Filter.eq('ADM1_NAME', 'Haryana'));
+
+// Debugging: Print fallback state
+print('Fallback Haryana state:', fallback_state.size());
+
+// Step 4: Create AOI, using table2 if available, else fallback
+var aoi = ee.Algorithms.If(
+  haryana_state.size().gt(0),
+  haryana_state.geometry().dissolve(),
+  fallback_state.geometry().dissolve()
+);
+
+// Cast aoi to ee.Geometry to avoid ComputedObject error
+aoi = ee.Geometry(aoi);
+
+// Debugging: Print and visualize AOI
+print('AOI geometry:', aoi);
+Map.addLayer(ee.Feature(aoi), {color: 'red'}, 'Haryana State');
+
+// Step 5: Filter and clip districts for Haryana
+var haryana_districts = table2.filter(ee.Filter.inList('district', [
+  'Faridabad','Gurgaon', 
+]));
+
+// Debugging: Print the number of filtered districts
+print('Filtered Haryana districts from table2:', haryana_districts.size());
+
+// Fallback districts from FAO/GAUL/2015/level2 if needed
+var fallback_districts = ee.FeatureCollection('FAO/GAUL/2015/level2')
+  .filter(ee.Filter.eq('ADM1_NAME', 'Haryana'));
+print('Fallback Haryana districts:', fallback_districts.size());
+
+// Use districts from table2 if available, else fallback
+var final_districts = ee.Algorithms.If(
+  haryana_districts.size().gt(0),
+  haryana_districts,
+  fallback_districts
+);
+
+// Clip districts to AOI
+var clipped_districts = ee.FeatureCollection(final_districts).map(function(feature) {
+  return feature.intersection(aoi, ee.ErrorMargin(1));
+});
+
+// Display clipped districts
+Map.addLayer(clipped_districts, {color: 'yellow'}, 'Haryana Districts');
+
+// Load Sentinel-2 for true color (using 2024 data for before flood)
+var s2 = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
+  .filterBounds(aoi)
+  .filterDate('2024-06-01', '2024-06-20')
+  .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 20))
+  .select(['B4', 'B3', 'B2'])
+  .median()
+  .clip(aoi);
+
+Map.addLayer(s2, {min: 0, max: 3000, bands: ['B4', 'B3', 'B2']}, 'True Color Before');
+
+// Load Sentinel-1 SAR data
+var collection = ee.ImageCollection('COPERNICUS/S1_GRD')
+  .filterBounds(aoi)
+  .filter(ee.Filter.listContains('transmitterReceiverPolarisation', 'VV'))
+  .select('VV');
+
+// Before and after flood periods (using 2024 data)
+var before = collection.filterDate('2024-05-01', '2024-06-15').mosaic();
+var after = collection.filterDate('2025-08-31', '2025-09-04').mosaic();
+
+// Clip images
+var before_clip = before.clip(aoi);
+var after_clip = after.clip(aoi);
+
+// Apply smoothening filter
+var before_s = before_clip.focal_median(30, 'circle', 'meters');
+var after_s = after_clip.focal_median(30, 'circle', 'meters');
+
+// Difference for verification
+var difference = after_s.subtract(before_s);
+var flood_extent = difference.lt(-3);
+var flood = flood_extent.updateMask(flood_extent);
+
+var visParams = {
+  bands: ['B1', 'B2', 'B2'],  // Using B2 twice as we only need two classes
+  min: 0,
+  max: 1,
+  palette: ['#00008B', '#00FFFF']  // Dark blue for natural water, cyan for new flooded
+};
+
+// Add layers
+Map.addLayer(before_clip, {min: -30, max: 0}, 'Before Flood');
+Map.addLayer(after_clip, {min: -30, max: 0}, 'After Flood');
+Map.addLayer(difference, {}, 'Difference');
+Map.addLayer(flood, {}, 'Flood');
+
+
+// Step 1: Inspect table2 to find correct property names and values
+print('Sample of table2:', table2.limit(10)); // Check ST_NM and district values
+print('Unique ST_NM values:', table2.aggregate_array('ST_NM').distinct()); // List all unique state names
+print('Unique district values:', table2.aggregate_array('district').distinct()); // List all unique district names
+
+// Step 2: Filter AOI for Uttar Pradesh from table2
+var up_state = table2.filter(ee.Filter.eq('ST_NM', 'Uttar Pradesh'));
+
+// Debugging: Print the number of features in filtered state
+print('Filtered Uttar Pradesh state from table2:', up_state.size());
+
+// Step 3: Use fallback dataset (FAO/GAUL/2015/level1) for Uttar Pradesh
+var fallback_state = ee.FeatureCollection('FAO/GAUL/2015/level1')
+  .filter(ee.Filter.eq('ADM1_NAME', 'Uttar Pradesh'));
+
+// Debugging: Print fallback state
+print('Fallback Uttar Pradesh state:', fallback_state.size());
+
+// Step 4: Create AOI, using table2 if available, else fallback
+var aoi = ee.Algorithms.If(
+  up_state.size().gt(0),
+  up_state.geometry().dissolve(),
+  fallback_state.geometry().dissolve()
+);
+
+// Cast aoi to ee.Geometry to avoid ComputedObject error
+aoi = ee.Geometry(aoi);
+
+// Debugging: Print and visualize AOI
+print('AOI geometry:');
+Map.addLayer(ee.Feature(aoi), {color: 'red'}, 'Uttar Pradesh State');
+
+// Step 5: Filter and clip districts for Uttar Pradesh
+var up_districts = table2.filter(ee.Filter.inList('district', [
+  'Agra', 'Deoria',  'Gautam Buddha Nagar', 'Ghaziabad', 'Ghazipur',]));
+
+// Debugging: Print the number of filtered districts
+print('Filtered Uttar Pradesh districts from table2:', up_districts.size());
+
+// Fallback districts from FAO/GAUL/2015/level2 if needed
+var fallback_districts = ee.FeatureCollection('FAO/GAUL/2015/level2')
+  .filter(ee.Filter.eq('ADM1_NAME', 'Uttar Pradesh'));
+print('Fallback Uttar Pradesh districts:', fallback_districts.size());
+
+// Use districts from table2 if available, else fallback
+var final_districts = ee.Algorithms.If(
+  up_districts.size().gt(0),
+  up_districts,
+  fallback_districts
+);
+
+// Clip districts to AOI
+var clipped_districts = ee.FeatureCollection(final_districts).map(function(feature) {
+  return feature.intersection(aoi, ee.ErrorMargin(1));
+});
+
+// Display clipped districts
+Map.addLayer(clipped_districts, {color: 'yellow'}, 'Uttar Pradesh Districts');
+
+// Load Sentinel-2 for true color (using 2024 data for before flood)
+var s2 = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
+  .filterBounds(aoi)
+  .filterDate('2024-06-01', '2024-06-20')
+  .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 20))
+  .select(['B4', 'B3', 'B2'])
+  .median()
+  .clip(aoi);
+
+Map.addLayer(s2, {min: 0, max: 3000, bands: ['B4', 'B3', 'B2']}, 'True Color Before');
+
+// Load Sentinel-1 SAR data
+var collection = ee.ImageCollection('COPERNICUS/S1_GRD')
+  .filterBounds(aoi)
+  .filter(ee.Filter.listContains('transmitterReceiverPolarisation', 'VV'))
+  .select('VV');
+
+// Before and after flood periods (using 2024 data)
+var before = collection.filterDate('2024-05-01', '2024-06-15').mosaic();
+var after = collection.filterDate('2025-08-31', '2025-09-04').mosaic();
+
+// Clip images
+var before_clip = before.clip(aoi);
+var after_clip = after.clip(aoi);
+
+// Apply smoothening filter
+var before_s = before_clip.focal_median(30, 'circle', 'meters');
+var after_s = after_clip.focal_median(30, 'circle', 'meters');
+
+// Difference for verification
+var difference = after_s.subtract(before_s);
+var flood_extent = difference.lt(-3);
+var flood = flood_extent.updateMask(flood_extent);
+
+var visParams = {
+  bands: ['B1', 'B2', 'B2'],  // Using B2 twice as we only need two classes
+  min: 0,
+  max: 1,
+  palette: ['#00008B', '#00FFFF']  // Dark blue for natural water, cyan for new flooded
+};
+
+// Add layers
+Map.addLayer(before_clip, {min: -30, max: 0}, 'Before Flood');
+Map.addLayer(after_clip, {min: -30, max: 0}, 'After Flood');
+Map.addLayer(difference, {}, 'Difference');
+Map.addLayer(flood, {}, 'Flood');
+
+// Step 2: Filter AOI for Delhi from table2
+var delhi_state = table1.filter(ee.Filter.eq('ST_NM', 'NCT of Delhi'));
+
+// Debugging: Print the number of features in filtered state
+print('Filtered Delhi state from table2:', delhi_state.size());
+
+// Step 3: Use fallback dataset (FAO/GAUL/2015/level1) for Delhi
+var fallback_state = ee.FeatureCollection('FAO/GAUL/2015/level1')
+  .filter(ee.Filter.eq('ADM1_NAME', 'NCT of Delhi'));
+
+// Debugging: Print fallback state
+print('Fallback Delhi state:', fallback_state.size());
+
+// Step 4: Create AOI, using table2 if available, else fallback
+var aoi = ee.Algorithms.If(
+  delhi_state.size().gt(0),
+  delhi_state.geometry().dissolve(),
+  fallback_state.geometry().dissolve()
+);
+
+// Cast aoi to ee.Geometry to avoid ComputedObject error
+aoi = ee.Geometry(aoi);
+
+// Debugging: Print and visualize AOI
+print('AOI geometry:', aoi);
+Map.addLayer(ee.Feature(aoi), {color: 'black'}, 'Delhi State');
+
+// Step 5: Filter and clip districts for Delhi
+var delhi_districts = table2.filter(ee.Filter.inList('district', [
+  'Central Delhi', 'East Delhi', 'New Delhi', 'North Delhi', 'North East Delhi', 
+  'North West Delhi', 'Shahdara', 'South Delhi', 'South East Delhi', 'South West Delhi', 
+  'West Delhi'
+]));
+
+// Debugging: Print the number of filtered districts
+print('Filtered Delhi districts from table2:', delhi_districts.size());
+
+// Fallback districts from FAO/GAUL/2015/level2 if needed
+var fallback_districts = ee.FeatureCollection('FAO/GAUL/2015/level2')
+  .filter(ee.Filter.eq('ADM1_NAME', 'NCT of Delhi'));
+print('Fallback Delhi districts:', fallback_districts.size());
+
+// Use districts from table2 if available, else fallback
+var final_districts = ee.Algorithms.If(
+  delhi_districts.size().gt(0),
+  delhi_districts,
+  fallback_districts
+);
+
+// Clip districts to AOI
+var clipped_districts = ee.FeatureCollection(final_districts).map(function(feature) {
+  return feature.intersection(aoi, ee.ErrorMargin(1));
+});
+
+// Display clipped districts
+Map.addLayer(clipped_districts, {color: 'yellow'}, 'Delhi Districts');
+
+// Load Sentinel-2 for true color (using 2024 data for before flood)
+var s2 = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
+  .filterBounds(aoi)
+  .filterDate('2024-06-01', '2024-06-20')
+  .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 20))
+  .select(['B4', 'B3', 'B2'])
+  .median()
+  .clip(aoi);
+
+Map.addLayer(s2, {min: 0, max: 3000, bands: ['B4', 'B3', 'B2']}, 'True Color Before');
+
+// Load Sentinel-1 SAR data
+var collection = ee.ImageCollection('COPERNICUS/S1_GRD')
+  .filterBounds(aoi)
+  .filter(ee.Filter.listContains('transmitterReceiverPolarisation', 'VV'))
+  .select('VV');
+
+// Before and after flood periods (using 2024 data)
+var before = collection.filterDate('2024-05-01', '2024-06-15').mosaic();
+var after = collection.filterDate('2025-08-31', '2025-09-04').mosaic();
+
+// Clip images
+var before_clip = before.clip(aoi);
+var after_clip = after.clip(aoi);
+
+// Apply smoothening filter
+var before_s = before_clip.focal_median(30, 'circle', 'meters');
+var after_s = after_clip.focal_median(30, 'circle', 'meters');
+
+// Difference for verification
+var difference = after_s.subtract(before_s);
+var flood_extent = difference.lt(-3);
+var flood = flood_extent.updateMask(flood_extent);
+
+var visParams = {
+  bands: ['B1', 'B2', 'B2'],  // Using B2 twice as we only need two classes
+  min: 0,
+  max: 1,
+  palette: ['#00008B', '#00FFFF']  // Dark blue for natural water, cyan for new flooded
+};
+
+// Add layers
+Map.addLayer(before_clip, {min: -30, max: 0}, 'Before Flood');
+Map.addLayer(after_clip, {min: -30, max: 0}, 'After Flood');
+Map.addLayer(difference, {}, 'Difference');
+Map.addLayer(flood, {}, 'Flood');
+
+// Export to Drive
+Export.image.toDrive({
+  image: flood.visualize(visParams), // Fixed waterVis to flood
+  description: 'FloodExtent_SeparatedWaterBodies',
+  folder: 'EarthEngineExports',
+  scale: 30,
+  region: aoi,
+  maxPixels: 1e13,
+  fileFormat: 'GeoTIFF'
+});
+
+Export.image.toDrive({
+  image: flood.float(),
+  description: 'FloodExtent',
+  scale: 10,
+  maxPixels: 1e13,
+  region: aoi,
+  crs: 'EPSG:4326'
+});
