@@ -1,0 +1,210 @@
+// Filter AOI for Punjab and clip to single geometry
+var punjab_state = table.filter(ee.Filter.eq('ST_NM', 'Punjab'));
+var aoi = punjab_state.geometry(); // Get state geometry
+
+// Filter and clip districts for Punjab from table2 using district
+var punjab_districts = table2.filter(ee.Filter.inList('district', [
+  'Amritsar', 'Barnala', 'Bathinda', 'Faridkot', 'Fatehgarh Sahib',
+  'Fazilka', 'Ferozepur', 'Gurdaspur', 'Hoshiarpur', 'Jalandhar',
+  'Kapurthala', 'Ludhiana', 'Malerkotla', 'Mansa', 'Moga', 'Muktsar',
+  'Pathankot', 'Patiala', 'Rupnagar', 'Sahibzada Ajit Singh Nagar',
+  'Sangrur', 'Shahid Bhagat Singh Nagar', 'Tarn Taran'
+]));
+
+var clipped_districts = punjab_districts.map(function(feature) {
+  return feature.intersection(aoi, ee.ErrorMargin(1));
+});
+
+// Display clipped state and districts
+Map.addLayer(aoi, {color: 'red'}, 'Punjab State');
+Map.addLayer(clipped_districts, {color: 'yellow'}, 'Punjab Districts');
+
+// Load Sentinel-2 for true color (using 2024 data for before flood)
+var s2 = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
+  .filterBounds(aoi)
+  .filterDate('2024-06-01', '2024-06-20')
+  .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 20))
+  .select(['B4', 'B3', 'B2'])
+  .median()
+  .clip(aoi);
+
+Map.addLayer(s2, {min: 0, max: 3000, bands: ['B4', 'B3', 'B2']}, 'True Color Before');
+
+// Load Sentinel-1 SAR data
+var collection = ee.ImageCollection('COPERNICUS/S1_GRD')
+  .filterBounds(aoi)
+  .filter(ee.Filter.listContains('transmitterReceiverPolarisation', 'VV'))
+  .select('VV');
+
+// Before and after flood periods
+var before = collection.filterDate('2025-05-01', '2025-06-15').mosaic();
+var after = collection.filterDate('2025-08-20', '2025-09-08').mosaic();
+
+// Clip images
+var before_clip = before.clip(aoi);
+var after_clip = after.clip(aoi);
+
+// Apply smoothening filter
+var before_s = before_clip.focal_median(30, 'circle', 'meters');
+var after_s = after_clip.focal_median(30, 'circle', 'meters');
+
+// Difference for verification
+var difference = after_s.subtract(before_s);
+var flood_extent = difference.lt(-3);
+var flood = flood_extent.updateMask(flood_extent);
+
+// Calculate flood area in square kilometers
+var floodArea = flood.multiply(ee.Image.pixelArea()).reduceRegion({
+  reducer: ee.Reducer.sum(),
+  geometry: aoi,
+  scale: 30,
+  maxPixels: 1e13,
+  bestEffort: true
+});
+
+var floodAreaKm2 = ee.Number(floodArea.get('VV')).divide(1e6);
+print('Total Flood/Water Area (sq km):', floodAreaKm2);
+
+// Calculate total Punjab area for reference
+var totalArea = ee.Image(1).multiply(ee.Image.pixelArea()).reduceRegion({
+  reducer: ee.Reducer.sum(),
+  geometry: aoi,
+  scale: 30,
+  maxPixels: 1e13,
+  bestEffort: true
+});
+
+var totalAreaKm2 = ee.Number(totalArea.get('constant')).divide(1e6);
+print('Total Punjab Area (sq km):', totalAreaKm2);
+
+// Calculate percentage of flooded area
+var floodPercentage = floodAreaKm2.divide(totalAreaKm2).multiply(100);
+print('Percentage of Punjab under flood/water (%):', floodPercentage);
+
+// Create area statistics for display
+var areaStats = ee.Dictionary({
+  'Flood_Area_km2': floodAreaKm2,
+  'Total_Area_km2': totalAreaKm2,
+  'Flood_Percentage': floodPercentage
+});
+print('Area Statistics:', areaStats);
+
+// Calculate district-wise flood areas
+var districtFloodAreas = clipped_districts.map(function(district) {
+  var districtGeom = ee.Feature(district).geometry();
+  var districtName = ee.Feature(district).get('district');
+  
+  // Calculate flood area within district
+  var districtFloodArea = flood.multiply(ee.Image.pixelArea()).reduceRegion({
+    reducer: ee.Reducer.sum(),
+    geometry: districtGeom,
+    scale: 30,
+    maxPixels: 1e13,
+    bestEffort: true
+  });
+  
+  var districtFloodKm2 = ee.Number(districtFloodArea.get('VV')).divide(1e6);
+  
+  // Calculate total district area
+  var districtTotalArea = ee.Image(1).multiply(ee.Image.pixelArea()).reduceRegion({
+    reducer: ee.Reducer.sum(),
+    geometry: districtGeom,
+    scale: 30,
+    maxPixels: 1e13,
+    bestEffort: true
+  });
+  
+  var districtTotalKm2 = ee.Number(districtTotalArea.get('constant')).divide(1e6);
+  var districtFloodPercent = districtFloodKm2.divide(districtTotalKm2).multiply(100);
+  
+  return ee.Feature(district).set({
+    'Flood_Area_km2': districtFloodKm2,
+    'Total_Area_km2': districtTotalKm2,
+    'Flood_Percentage': districtFloodPercent
+  });
+});
+
+print('District-wise Flood Statistics:', districtFloodAreas);
+
+var visParams = {
+  bands: ['B1', 'B2', 'B2'], // Using B2 twice as we only need two classes
+  min: 0,
+  max: 1,
+  palette: ['#00008B', '#00FFFF'] // Dark blue for natural water, cyan for new flooded
+};
+
+// Add layers
+Map.addLayer(before_clip, {min: -30, max: 0}, 'Before Flood');
+Map.addLayer(after_clip, {min: -30, max: 0}, 'After Flood');
+Map.addLayer(difference, {min: -10, max: 10, palette: ['red', 'white', 'blue']}, 'Difference');
+Map.addLayer(flood, {palette: ['blue']}, 'Flood Extent');
+
+// Create a legend for the flood map
+var legend = ui.Panel({
+  style: {
+    position: 'bottom-right',
+    padding: '8px 15px'
+  }
+});
+
+var legendTitle = ui.Label({
+  value: 'Flood Analysis Legend',
+  style: {
+    fontWeight: 'bold',
+    fontSize: '16px',
+    margin: '0 0 4px 0',
+    padding: '0'
+  }
+});
+
+legend.add(legendTitle);
+
+var makeRow = function(color, name) {
+  var colorBox = ui.Label({
+    style: {
+      backgroundColor: color,
+      padding: '8px',
+      margin: '0 0 4px 0'
+    }
+  });
+  var description = ui.Label({
+    value: name,
+    style: { margin: '0 0 4px 0' }
+  });
+  return ui.Panel({
+    widgets: [colorBox, description],
+    layout: ui.Panel.Layout.flow('horizontal')
+  });
+};
+
+legend.add(makeRow('blue', 'Flood/Water Areas'));
+
+Map.add(legend);
+
+// Export to Drive
+Export.image.toDrive({
+  image: flood.visualize({palette: ['blue']}),
+  description: 'FloodExtent_SeparatedWaterBodies',
+  folder: 'EarthEngineExports',
+  scale: 30,
+  region: aoi,
+  maxPixels: 1e13,
+  fileFormat: 'GeoTIFF'
+});
+
+Export.image.toDrive({
+  image: flood.float(),
+  description: 'FloodExtent',
+  scale: 10,
+  maxPixels: 1e13,
+  region: aoi,
+  crs: "EPSG:4326"
+});
+
+// Export area statistics as CSV
+Export.table.toDrive({
+  collection: districtFloodAreas,
+  description: 'Punjab_District_Flood_Statistics',
+  folder: 'EarthEngineExports',
+  fileFormat: 'CSV'
+});
