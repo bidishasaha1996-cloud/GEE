@@ -1,0 +1,264 @@
+// Define necessary variables
+var year = '2017'; // Year for export description
+var rgbVisParam = { bands: ['B4', 'B3', 'B2'], min: 0, max: 0.3 }; // RGB visualization parameters
+
+// Define ROI using table with states of India under ST_NM column
+var roi = table.filter(ee.Filter.eq('ST_NM', 'Punjab'));
+
+// === Load Punjab Districts ===
+// Get all districts within Punjab state
+var punjab_districts = roi;
+
+var clipped_districts = punjab_districts.map(function(feature) {
+  return feature.intersection(roi.geometry(), ee.ErrorMargin(1));
+});
+
+Map.addLayer(clipped_districts, {color: 'yellow'}, 'Punjab Districts');
+
+// Cloud masking function for Sentinel-2 (relaxed to reduce masking)
+function maskS2clouds(image) {
+  var qa = image.select('QA60');
+  var cloudBitMask = 1 << 10;
+  var cirrusBitMask = 1 << 11;
+  var mask = qa.bitwiseAnd(cloudBitMask).eq(0)
+      .and(qa.bitwiseAnd(cirrusBitMask).eq(0));
+  return image.updateMask(mask).divide(10000);
+}
+
+// Process Sentinel-2 imagery
+var imagery = ee.ImageCollection('COPERNICUS/S2_HARMONIZED')
+                .filterDate('2024-03-01', '2024-06-30') // Summer months for less cloud cover
+                .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 50))
+                .filterBounds(roi)
+                .map(maskS2clouds)
+                .map(function(img) { return img.clip(roi); })
+                .median();
+
+// Check for valid pixels in imagery
+var validPixels = imagery.select('B2').unmask(0).gt(0).reduceRegion({
+  reducer: ee.Reducer.sum(),
+  geometry: roi,
+  scale: 30,
+  maxPixels: 1e13
+});
+print('Valid Pixels in Imagery:', validPixels);
+
+// Select bands and compute indices
+function selectBands(image) {
+  var NDVI = image.expression(
+    '(NIR - RED) / (NIR + RED)', {
+      'NIR': image.select('B8'),
+      'RED': image.select('B4')
+    }).rename('NDVI');
+  var ndbi = image.expression(
+    '(SWIR - NIR) / (SWIR + NIR)', {
+      'NIR': image.select('B8'),
+      'SWIR': image.select('B11')
+    }).rename('NDBI');
+  var mndwi = image.expression(
+    '(GREEN - SWIR1) / (GREEN + SWIR1)', {
+      'GREEN': image.select('B3'),
+      'SWIR1': image.select('B11')
+    }).rename('MNDWI');
+  var ndsli = image.expression(
+    '(RED - SWIR1) / (RED + SWIR1)', {
+      'RED': image.select('B4'),
+      'SWIR1': image.select('B11')
+    }).rename('NDSLI');
+  var bands = ['B2', 'B3', 'B4', 'B8', 'B11', 'B12'];
+  image = image.select(bands);
+  return image.addBands([NDVI, mndwi, ndbi, ndsli]);
+}
+
+// Apply selectBands to imagery
+var imagery = selectBands(imagery);
+print('Processed Imagery:', imagery);
+
+// Visualize RGB
+Map.addLayer(imagery, rgbVisParam, 'dataset_rgbiz', true);
+
+// Create training and testing datasets
+var sample = Water.merge(Vegetation).merge(Builtup).merge(Cropland).merge(barren).randomColumn();
+print('Training and Testing Sample:');
+
+var train = sample.filter(ee.Filter.lte('random', 0.8));
+var test = sample.filter(ee.Filter.gt('random', 0.8));
+print('Training Data Size:', train.size());
+print('Testing Data Size:', test.size());
+
+var trainSample = imagery.sampleRegions({
+  collection: train,
+  scale: 10,
+  properties: ['class'],
+  tileScale: 8
+});
+print('Training Sample:', trainSample);
+
+var testSample = imagery.sampleRegions({
+  collection: test,
+  scale: 10,
+  properties: ['class'],
+  tileScale: 8
+});
+print('Testing Sample:', testSample);
+
+// Validate Vegetation points
+var vegetationPointsValid = imagery.select('B2').unmask(0).gt(0).reduceRegions({
+  collection: Vegetation,
+  reducer: ee.Reducer.max(),
+  scale: 10
+});
+print('Vegetation Points Valid:', vegetationPointsValid);
+
+// Define legend dictionary (corrected)
+var legendDict = {
+  'LULC_class_values': [1, 2, 3, 4, 5],
+  'LULC_class_palette': ['ff2f07', '208603', '07d7ff', 'eee105', 'af9890'] // Built up (red), Vegetation (dark green), Water (blue), Cropland (yellow), Barren (brown)
+};
+
+// Train Random Forest model
+var rf_model = ee.Classifier.smileRandomForest(100).train(trainSample, 'class', imagery.bandNames());
+
+// Accuracy assessment
+var cm = testSample.classify(rf_model, 'predict').errorMatrix('class', 'predict');
+print('Confusion Matrix:', cm, 'Accuracy:', cm.accuracy(), 'Kappa:', cm.kappa());
+
+// Classify and visualize LULC
+var lulc = imagery.classify(rf_model, 'LULC').toByte().set(legendDict);
+print('LULC Image:', lulc);
+
+// Check LULC class distribution
+var lulcHistogram = lulc.reduceRegion({
+  reducer: ee.Reducer.histogram(),
+  geometry: roi,
+  scale: 30,
+  maxPixels: 1e13
+});
+print('LULC Class Histogram:', lulcHistogram);
+
+// Define visualization parameters for LULC (corrected)
+var lulcVisParam = {
+  min: 1,
+  max: 5,
+  palette: ['ff2f07', '208603', '07d7ff', 'eee105', 'af9890'] // Built up (red), Vegetation (dark green), Water (blue), Cropland (yellow), Barren (brown)
+};
+Map.addLayer(lulc, lulcVisParam, 'lulc', true); // Remove .unmask(0)
+
+// Calculate areas for each LULC class at 30m scale
+// Built up (class 1)
+var builtupMask = lulc.eq(1);
+var builtupArea = builtupMask.multiply(ee.Image.pixelArea()).reduceRegion({
+  reducer: ee.Reducer.sum(),
+  geometry: roi,
+  scale: 30,
+  maxPixels: 1e13,
+  bestEffort: true
+});
+var builtupAreaKm2 = ee.Number(builtupArea.get('LULC')).divide(1e6);
+print('Built up Area (sq km):', builtupAreaKm2);
+
+// Vegetation (class 2)
+var vegetationMask = lulc.eq(2);
+var vegetationArea = vegetationMask.multiply(ee.Image.pixelArea()).reduceRegion({
+  reducer: ee.Reducer.sum(),
+  geometry: roi,
+  scale: 30,
+  maxPixels: 1e13,
+  bestEffort: true
+});
+var vegetationAreaKm2 = ee.Number(vegetationArea.get('LULC')).divide(1e6);
+print('Vegetation Area (sq km):', vegetationAreaKm2);
+
+// Water (class 3)
+var waterMask = lulc.eq(3);
+var waterArea = waterMask.multiply(ee.Image.pixelArea()).reduceRegion({
+  reducer: ee.Reducer.sum(),
+  geometry: roi,
+  scale: 30,
+  maxPixels: 1e13,
+  bestEffort: true
+});
+var waterAreaKm2 = ee.Number(waterArea.get('LULC')).divide(1e6);
+print('Water Area (sq km):', waterAreaKm2);
+
+// Cropland (class 4)
+var croplandMask = lulc.eq(4);
+var croplandArea = croplandMask.multiply(ee.Image.pixelArea()).reduceRegion({
+  reducer: ee.Reducer.sum(),
+  geometry: roi,
+  scale: 30,
+  maxPixels: 1e13,
+  bestEffort: true
+});
+var croplandAreaKm2 = ee.Number(croplandArea.get('LULC')).divide(1e6);
+print('Cropland Area (sq km):', croplandAreaKm2);
+
+// Barren (class 5)
+var barrenMask = lulc.eq(5);
+var barrenArea = barrenMask.multiply(ee.Image.pixelArea()).reduceRegion({
+  reducer: ee.Reducer.sum(),
+  geometry: roi,
+  scale: 30,
+  maxPixels: 1e13,
+  bestEffort: true
+});
+var barrenAreaKm2 = ee.Number(barrenArea.get('LULC')).divide(1e6);
+print('Barren Area (sq km):', barrenAreaKm2);
+
+// Create legend UI (corrected)
+var legend = ui.Panel({
+  style: {
+    position: 'bottom-left',
+    padding: '8px 15px'
+  }
+});
+
+var legendTitle = ui.Label({
+  value: 'LULC Legend',
+  style: {
+    fontWeight: 'bold',
+    fontSize: '18px',
+    margin: '0 0 4px 0',
+    padding: '0'
+  }
+});
+
+legend.add(legendTitle);
+
+var makeRow = function(color, name) {
+  var colorBox = ui.Label({
+    style: {
+      backgroundColor: '#' + color,
+      padding: '8px',
+      margin: '0 0 4px 0'
+    }
+  });
+  var description = ui.Label({
+    value: name,
+    style: { margin: '0 0 4px 0' }
+  });
+  return ui.Panel({
+    widgets: [colorBox, description],
+    layout: ui.Panel.Layout.flow('horizontal')
+  });
+};
+
+var palette = ['ff2f07', '208603', '07d7ff', 'eee105', 'af9890']; // Built up (red), Vegetation (dark green), Water (blue), Cropland (yellow), Barren (brown)
+var names = ['Built up', 'Vegetation', 'Water', 'Cropland', 'Barren'];
+
+for (var i = 0; i < names.length; i++) {
+  legend.add(makeRow(palette[i], names[i]));
+}
+
+Map.add(legend);
+
+// Export LULC map
+Export.image.toDrive({
+  image: lulc,
+  scale: 10,
+  region: roi,
+  crs: 'EPSG:4326',
+  maxPixels: 1e13,
+  folder: 'LULC',
+  description: 'LULC_Classification_Punjab_' + year
+});
