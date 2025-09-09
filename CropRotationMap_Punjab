@@ -1,0 +1,239 @@
+/***********************************************************
+Punjab Kharif crop distribution — PAPER-FAITHFUL (v5.2)
+Upadhyay, Ray, Panigrahy (2008)
+- 10-day NDVI (May–Nov)
+- Sowing = 10 days before max{NDVI(t+1)-NDVI(t)} in first 60 days
+- Harvest = 10 days after max{NDVI(t)-NDVI(t+1)} for the season
+Classes: Rice (early/normal/late collapsed), Cotton, Maize, Non-agri
+***********************************************************/
+
+// --------------------- USER PARAMS ------------------------
+var YEAR = 2023;          // Kharif year
+var STEP_DAYS = 10;       // 10-day composites
+var EXPORT_SCALE = 10;    // metres
+var SHOW_BASE = false;
+var SHOW_DIAGNOSTICS = false;
+
+// --------------------- AOI -------------------------------
+var gaul1 = ee.FeatureCollection('FAO/GAUL/2015/level1')
+  .filter(ee.Filter.eq('ADM0_NAME','India'))
+  .filter(ee.Filter.eq('ADM1_NAME','Punjab'));
+var gaul2 = ee.FeatureCollection('FAO/GAUL/2015/level2')
+  .filter(ee.Filter.eq('ADM0_NAME','India'))
+  .filter(ee.Filter.eq('ADM1_NAME','Punjab'));
+var punjab = gaul1.geometry();
+Map.centerObject(punjab, 7);
+
+// --------------------- SEASON (May–Nov) ------------------
+var seasonStart = ee.Date.fromYMD(YEAR, 5, 1);
+var seasonEnd   = ee.Date.fromYMD(YEAR,11,21);
+
+// --------------------- Sentinel-2 NDVI --------------------
+function maskS2sr(i){
+  var scl = i.select('SCL');
+  var bad = scl.eq(3).or(scl.eq(8)).or(scl.eq(9)).or(scl.eq(10)).or(scl.eq(11));
+  return i.updateMask(bad.not()).divide(10000)
+          .copyProperties(i, ['system:time_start']);
+}
+var s2 = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
+  .filterBounds(punjab)
+  .filterDate(seasonStart.advance(-10,'day'), seasonEnd.advance(10,'day'))
+  .map(maskS2sr)
+  .map(function(i){ return i.addBands(i.normalizedDifference(['B8','B4']).rename('NDVI')); });
+
+// ---- 10-day composite stack with DOY band
+function makeDates(start, end, stepDays){
+  var n = end.difference(start, 'day').divide(stepDays).floor();
+  return ee.List.sequence(0, n).map(function(k){
+    return start.advance(ee.Number(k).multiply(stepDays), 'day');
+  });
+}
+var dates = makeDates(seasonStart, seasonEnd, STEP_DAYS);
+
+var tenDayIC = ee.ImageCollection.fromImages(
+  dates.map(function(d){
+    d = ee.Date(d);
+    var e = d.advance(STEP_DAYS-1, 'day');
+    var ndvi = s2.filterDate(d, e).select('NDVI').median().clip(punjab);
+    var doy  = ee.Image.constant(d.getRelative('day','year')).rename('DOY').toFloat();
+    return ndvi.rename('NDVI')
+              .addBands(doy)
+              .set('system:time_start', d.millis());
+  })
+).sort('system:time_start');
+
+// --------------------- Phenology metrics ------------------
+// Max NDVI & DoY of max
+var ndviMaxImg = tenDayIC.qualityMosaic('NDVI');
+var NDVI_max = ndviMaxImg.select('NDVI').rename('NDVI_max');
+var DOY_max  = ndviMaxImg.select('DOY').rename('DOY_max');
+
+var NDVI_min  = tenDayIC.select('NDVI').min().rename('NDVI_min');
+var NDVI_mean = tenDayIC.select('NDVI').mean().rename('NDVI_mean');
+var NDVI_amp  = NDVI_max.subtract(NDVI_min).rename('NDVI_amp');
+
+// ---- Pairwise NDVI differences for sow/har thresholds
+var nImgs = tenDayIC.size();
+var imgList = tenDayIC.toList(nImgs);
+
+var diffIC = ee.ImageCollection.fromImages(
+  ee.List.sequence(0, ee.Number(nImgs).subtract(2)).map(function(i){
+    i = ee.Number(i);
+    var t  = ee.Image(imgList.get(i));
+    var t1 = ee.Image(imgList.get(i.add(1)));
+    var dNDVI_pos = t1.select('NDVI').subtract(t.select('NDVI')).rename('dNDVI_pos'); // rise
+    var dNDVI_neg = t.select('NDVI').subtract(t1.select('NDVI')).rename('dNDVI_neg'); // fall
+    var DOY_t     = t.select('DOY').rename('DOY_t');
+    var NDVI_t    = t.select('NDVI').rename('NDVI_t');
+    return ee.Image.cat([dNDVI_pos, dNDVI_neg, DOY_t, NDVI_t])
+      .set('system:time_start', t.get('system:time_start'));
+  })
+).sort('system:time_start');
+
+// mask each image to first 60 days for sowing search
+var first60EndDOY = ee.Number(seasonStart.advance(60,'day').getRelative('day','year'));
+var sowIC = diffIC.map(function(img){
+  return img.updateMask(img.select('DOY_t').lte(first60EndDOY));
+});
+
+// SOWING: max positive jump (in first 60 days), sow = DOY_emerge − 10
+var sowImg = sowIC.qualityMosaic('dNDVI_pos');
+var DOY_emerge = sowImg.select('DOY_t').rename('DOY_emerge');
+var NDVI_thr   = sowImg.select('NDVI_t').rename('NDVI_thr');
+var DOY_sow    = DOY_emerge.subtract(10).rename('DOY_sow');
+
+// HARVEST: max negative jump (for the season), har = DOY_mature + 10
+var harImg = diffIC.qualityMosaic('dNDVI_neg');
+var DOY_mature = harImg.select('DOY_t').rename('DOY_mature');
+var DOY_har    = DOY_mature.add(10).rename('DOY_har');
+
+// Growing-season metrics
+var GS_len = DOY_har.subtract(DOY_sow).rename('GS_len'); // days
+var frac_greenup = DOY_max.subtract(DOY_sow).divide(GS_len).rename('frac_greenup');
+var rate_green = NDVI_max.subtract(NDVI_thr)
+  .divide(DOY_max.subtract(DOY_sow).max(1)).rename('rate_green');
+var rate_senes = NDVI_max.subtract(NDVI_thr)
+  .divide(DOY_har.subtract(DOY_max).max(1)).rename('rate_senes');
+
+// Simple non-agri mask (low greenness & seasonality)
+var nonAgri = NDVI_mean.lt(0.20).or(NDVI_amp.lt(0.20));
+
+// --------------------- Class prototypes (Table 2) ---------
+var P_ER = {max:0.78, min:0.244, mean:0.53, amp:0.54,
+            doyMax:218, doySow:165, doyHar:256, GS:110, frac:0.4675, rG:0.0010, rS:0.0082};
+var P_NR = {max:0.78, min:0.27,  mean:0.55, amp:0.50,
+            doyMax:218, doySow:173, doyHar:258, GS:110, frac:0.4054, rG:0.0012, rS:0.0071};
+var P_LR = {max:0.79, min:0.26,  mean:0.55, amp:0.53,
+            doyMax:218, doySow:178, doyHar:268, GS:107, frac:0.3665, rG:0.0013, rS:0.0069};
+var P_CT = {max:0.73, min:0.27,  mean:0.53, amp:0.46,
+            doyMax:225, doySow:176, doyHar:269, GS:106, frac:0.37,   rG:0.0012, rS:0.0057};
+var P_MZ = {max:0.77, min:0.38,  mean:0.59, amp:0.38,
+            doyMax:218, doySow:176, doyHar:269, GS:109, frac:0.298,  rG:0.0009, rS:0.0054};
+
+// Feature scales (balance contributions in distance score)
+var S = {max:0.08, min:0.06, mean:0.06, amp:0.08, doy:10, gs:15, frac:0.08, r:0.003};
+
+// Distance to a prototype (normalized squared error)
+function distanceTo(proto){
+  var d = ee.Image(0);
+  d = d.add(NDVI_max.subtract(proto.max).divide(S.max).pow(2));
+  d = d.add(NDVI_min.subtract(proto.min).divide(S.min).pow(2));
+  d = d.add(NDVI_mean.subtract(proto.mean).divide(S.mean).pow(2));
+  d = d.add(NDVI_amp.subtract(proto.amp).divide(S.amp).pow(2));
+  d = d.add(DOY_max.subtract(proto.doyMax).divide(S.doy).pow(2));
+  d = d.add(DOY_sow.subtract(proto.doySow).divide(S.doy).pow(2));
+  d = d.add(DOY_har.subtract(proto.doyHar).divide(S.doy).pow(2));
+  d = d.add(GS_len.subtract(proto.GS).divide(S.gs).pow(2));
+  d = d.add(frac_greenup.subtract(proto.frac).divide(S.frac).pow(2));
+  d = d.add(rate_green.subtract(proto.rG).divide(S.r).pow(2));
+  d = d.add(rate_senes.subtract(proto.rS).divide(S.r).pow(2));
+  return d.updateMask(nonAgri.not());
+}
+
+// Distances (bands)
+var D_ER = distanceTo(P_ER).rename('d_ER');
+var D_NR = distanceTo(P_NR).rename('d_NR');
+var D_LR = distanceTo(P_LR).rename('d_LR');
+var D_CT = distanceTo(P_CT).rename('d_CT');
+var D_MZ = distanceTo(P_MZ).rename('d_MZ');
+
+// ---------- FIX: choose class by min distance (no array ops) ----------
+var minDist = D_ER.min(D_NR).min(D_LR).min(D_CT).min(D_MZ);
+
+var fine = ee.Image(0)
+  .where(minDist.eq(D_ER), 1)  // Early Rice
+  .where(minDist.eq(D_NR), 2)  // Normal Rice
+  .where(minDist.eq(D_LR), 3)  // Late Rice
+  .where(minDist.eq(D_CT), 4)  // Cotton
+  .where(minDist.eq(D_MZ), 5)  // Maize
+  .rename('fine');
+
+// Collapse early/normal/late rice to "Rice"
+var riceMask   = fine.eq(1).or(fine.eq(2)).or(fine.eq(3));
+var cottonMask = fine.eq(4);
+var maizeMask  = fine.eq(5);
+
+// Codes: 1=Rice, 2=Cotton, 3=Maize, 4=Non-agri
+var cls = ee.Image(4).clip(punjab);
+cls = cls.where(riceMask,   1);
+cls = cls.where(cottonMask, 2);
+cls = cls.where(maizeMask,  3);
+cls = cls.where(nonAgri,    4);
+
+// --------------------- VISUALS -----------------------------
+var palette = ['#4CAF50','#FFEB3B','#7E57C2','#7DE0E6']; // Rice, Cotton, Maize, Non-agri
+var vis = {min:1, max:4, palette: palette};
+
+if (SHOW_BASE){
+  var tc = s2.filterDate(seasonStart, seasonEnd).median()
+             .select(['B4','B3','B2']).clip(punjab);
+  Map.addLayer(tc, {min:0, max:0.2}, 'S2 True Color (May–Nov)', false);
+}
+Map.addLayer(cls, vis, 'Kharif crop distribution — paper method', true);
+Map.addLayer(gaul2.style({color:'#333', width:1, fillColor:'00000000'}), {}, 'Districts', true);
+
+// Legend
+(function addLegend(){
+  var labels = ['Rice','Cotton','Maize','Non-agri'];
+  var legend = ui.Panel({style:{position:'bottom-left',padding:'8px', backgroundColor:'white'}});
+  legend.add(ui.Label('Kharif crop distribution', {fontWeight:'bold'}));
+  for (var i=0;i<labels.length;i++){
+    var row = ui.Panel({layout: ui.Panel.Layout.Flow('horizontal')});
+    var box = ui.Label('', {backgroundColor: palette[i], padding:'8px', margin:'0 8px 4px 0'});
+    row.add(box); row.add(ui.Label(labels[i]));
+    legend.add(row);
+  }
+  Map.add(legend);
+})();
+
+// --------------------- AREAS (km²) -------------------------
+var pxArea = ee.Image.pixelArea().divide(1e6); // km²
+var areas = ee.Image(1).rename('one').addBands(cls).multiply(pxArea)
+  .reduceRegion({
+    reducer: ee.Reducer.sum().group({groupField:1, groupName:'class'}),
+    geometry: punjab,
+    scale: EXPORT_SCALE,
+    maxPixels: 1e13
+  });
+print('Class areas (km²):', areas);
+
+// --------------------- EXPORT ------------------------------
+Export.image.toDrive({
+  image: cls,
+  description: 'Punjab_Kharif_PaperMethod_v52_' + YEAR,
+  region: punjab,
+  scale: EXPORT_SCALE,
+  maxPixels: 1e13
+});
+
+// --------------------- (Optional) diagnostics --------------
+if (SHOW_DIAGNOSTICS){
+  Map.addLayer(NDVI_max, {min:0.6, max:0.9, palette:['white','green']}, 'NDVI max', false);
+  Map.addLayer(NDVI_min, {min:0.1, max:0.5, palette:['white','brown']}, 'NDVI min', false);
+  Map.addLayer(NDVI_mean,{min:0.3, max:0.7, palette:['white','teal']}, 'NDVI mean', false);
+  Map.addLayer(NDVI_amp, {min:0.2, max:0.7, palette:['white','red']}, 'NDVI amplitude', false);
+  Map.addLayer(DOY_sow,  {min:140, max:200, palette:['#ffffcc','#41b6c4']}, 'DOY sow', false);
+  Map.addLayer(DOY_max,  {min:190, max:240, palette:['purple','cyan','green','yellow']}, 'DOY max', false);
+  Map.addLayer(DOY_har,  {min:240, max:300, palette:['#fee08b','#d73027']}, 'DOY har', false);
+  Map.addLayer(frac_greenup, {min:0.2, max:0.6, palette:['#f7fcf5','#006d2c']}, 'Frac green-up', false);
+}
