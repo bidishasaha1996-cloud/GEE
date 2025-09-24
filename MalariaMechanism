@@ -1,0 +1,91 @@
+// Load the Tamil Nadu boundary
+var tamilNadu = ee.FeatureCollection('FAO/GAUL_SIMPLIFIED_500m/2015/level1')
+                 .filter(ee.Filter.eq('ADM1_NAME', 'Tamil Nadu'));
+
+// Center the map
+Map.centerObject(tamilNadu, 7);
+Map.addLayer(tamilNadu, {color: 'red'}, 'Tamil Nadu Boundary');
+
+// Load environmental data
+// 1. Temperature (MODIS)
+var temperature = ee.ImageCollection('MODIS/061/MOD11A2')
+                     .filterDate('2023-01-01', '2023-12-31')
+                     .select('LST_Day_1km')
+                     .map(function(image) {
+                       return image.multiply(0.02).subtract(273.15)
+                                   .copyProperties(image, ['system:time_start']);
+                     });
+var meanTemperature = temperature.mean().clip(tamilNadu);
+
+// 2. Precipitation (CHIRPS)
+var precipitation = ee.ImageCollection('UCSB-CHG/CHIRPS/DAILY')
+                       .filterDate('2023-01-01', '2023-12-31');
+var totalPrecipitation = precipitation.sum().clip(tamilNadu);
+
+// 3. Vegetation Index (NDVI from Sentinel-2)
+var sentinel2 = ee.ImageCollection('COPERNICUS/S2')
+                  .filterDate('2023-01-01', '2023-12-31')
+                  .filterBounds(tamilNadu)
+                  .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 20))
+                  .map(function(image) {
+                    var ndvi = image.normalizedDifference(['B8', 'B4']).rename('NDVI');
+                    return image.addBands(ndvi);
+                  });
+var meanNDVI = sentinel2.select('NDVI').mean().clip(tamilNadu);
+
+// 4. Water Bodies (JRC Global Surface Water)
+var waterOccurrence = ee.ImageCollection('JRC/GSW1_4/MonthlyHistory')
+                         .select('water') // Corrected from 'occurrence' to 'water'
+                         .mean()
+                         .clip(tamilNadu);
+
+// Combine the variables into a single multiband image
+var predictors = meanTemperature.rename('Temperature')
+                 .addBands(totalPrecipitation.rename('Precipitation'))
+                 .addBands(meanNDVI.rename('NDVI'))
+                 .addBands(waterOccurrence.rename('WaterOccurrence'));
+
+// Visualize the environmental layers
+Map.addLayer(meanTemperature, {min: 20, max: 40, palette: ['blue', 'yellow', 'red']}, 'Mean Temperature');
+Map.addLayer(totalPrecipitation, {min: 0, max: 1000, palette: ['white', 'blue']}, 'Total Precipitation');
+Map.addLayer(meanNDVI, {min: 0, max: 1, palette: ['brown', 'green']}, 'Mean NDVI');
+Map.addLayer(waterOccurrence, {min: 0, max: 100, palette: ['white', 'blue']}, 'Water Occurrence');
+
+// Sample the predictors for training data
+// Add training points based on known malaria cases or hotspots in Tamil Nadu
+var malariaCases = ee.FeatureCollection([
+  ee.Feature(ee.Geometry.Point([78.1198, 11.6643]), {'Malaria': 1}), // Example: Salem
+  ee.Feature(ee.Geometry.Point([78.7047, 10.7905]), {'Malaria': 1}), // Example: Trichy
+  ee.Feature(ee.Geometry.Point([79.1325, 12.9716]), {'Malaria': 1}), // Example: Chennai
+  ee.Feature(ee.Geometry.Point([77.1025, 11.2558]), {'Malaria': 0}), // Example: Coimbatore
+  ee.Feature(ee.Geometry.Point([78.7047, 9.9252]), {'Malaria': 0})   // Example: Madurai
+]);
+
+// Overlay predictors on malaria cases
+var trainingData = predictors.sampleRegions({
+  collection: malariaCases,
+  properties: ['Malaria'],
+  scale: 1000
+});
+
+// Train a Random Forest Classifier
+var classifier = ee.Classifier.smileRandomForest(50).train({
+  features: trainingData,
+  classProperty: 'Malaria',
+  inputProperties: ['Temperature', 'Precipitation', 'NDVI', 'WaterOccurrence']
+});
+
+// Classify the region
+var malariaRisk = predictors.classify(classifier).rename('MalariaRisk');
+
+// Visualize predicted malaria risk
+Map.addLayer(malariaRisk, {min: 0, max: 1, palette: ['green', 'red']}, 'Malaria Risk');
+
+// Export predicted malaria risk map
+Export.image.toDrive({
+  image: malariaRisk,
+  description: 'TamilNadu_Malaria_Risk_Map',
+  scale: 1000,
+  region: tamilNadu,
+  fileFormat: 'GeoTIFF'
+});
