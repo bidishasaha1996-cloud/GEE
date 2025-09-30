@@ -1,0 +1,253 @@
+var geometry = ee.Geometry.Polygon(
+  [[
+    [87.47880234666736, 21.431810975917568],
+    [91.64262070604236, 21.431810975917568],
+    [91.64262070604236, 22.917125518284493],
+    [87.47880234666736, 22.917125518284493],
+    [87.47880234666736, 21.431810975917568]  
+  ]]
+);/**** MALARIA MECHANISM — RULE-BASED GREEN/RED ********************************
+ * If more than 5 criteria are fulfilled at a pixel => GREEN, else RED.
+ * Draw an AOI polygon named 'geometry' with the Code Editor tools.
+ * Bidisha Saha • 2025-09-24
+ ******************************************************************************/
+
+/*** 0) USER SETTINGS *********************************************************/
+var AOI = geometry;              // Drawn geometry
+var START = '2024-06-01';        // Change as needed
+var END   = '2024-10-31';
+
+// Mode: if STRICT_ABSOLUTE is true -> need >5 criteria (absolute).
+// If false -> RELATIVE mode: need >60% of valid criteria + at least 6 valid criteria.
+var STRICT_ABSOLUTE = false;
+
+// Toggle individual criteria ON/OFF (must keep >=6 total if STRICT_ABSOLUTE)
+var USE_TEMP      = true;   // Air temperature (°C)
+var USE_RAIN      = true;   // Total rainfall (mm)
+var USE_TURBIDITY = true;   // Sentinel-2 NDTI (proxy)
+var USE_SALINITY  = true;   // HYCOM psu (marine)
+var USE_CURRENTS  = true;   // HYCOM m/s (marine)
+var USE_DEPTH     = true;   // ETOPO1 depth (m) oceanic
+var USE_DO_SAT    = true;   // DO saturation (mg/L, marine; computed from HYCOM T & S)
+var USE_PH        = false;  // Optional pH raster (provide your asset id below)
+
+// Optional pH asset (set USE_PH=true then put your asset id here)
+// var PH_IMAGE = ee.Image('users/<you>/biooracle_pH_mean').rename('pH');
+
+/*** 1) MAP INIT ***************************************************************/
+Map.centerObject(AOI, 8);
+Map.addLayer(AOI, {color:'cyan'}, 'AOI');
+
+/*** 2) DATASETS ***************************************************************
+ * Air temp: ERA5-Land Daily Aggregated (K)
+ * Rainfall: CHIRPS Daily (mm/day)
+ * Turbidity proxy: Sentinel-2 SR Harmonized (NDTI)
+ * Marine: HYCOM salinity/temp/currents (psu, °C, m/s)
+ * Bathymetry: NOAA ETOPO1 (m); convert ocean depths positive down
+ * DO saturation: Garcia & Gordon (1992) from sea temp & salinity
+ ******************************************************************************/
+
+// 2.1 Air temperature (°C)
+var era5 = ee.ImageCollection('ECMWF/ERA5_LAND/DAILY_AGGR')
+  .filterDate(START, END)
+  .select('temperature_2m');  // Kelvin
+var airT = era5.mean().subtract(273.15).rename('T2M_C').clip(AOI);
+
+// 2.2 Rainfall (mm) from CHIRPS
+var chirps = ee.ImageCollection('UCSB-CHG/CHIRPS/DAILY')
+  .filterDate(START, END).select('precipitation');
+var rain = chirps.sum().rename('Rain_mm').clip(AOI);
+
+// 2.3 Sentinel-2 SR for NDTI (cloud-masked)
+function s2Mask(img){
+  var scl = img.select('SCL');
+  var ok = scl.neq(3).and(scl.neq(8)).and(scl.neq(9)).and(scl.neq(10)).and(scl.neq(11));
+  return img.updateMask(ok);
+}
+var s2 = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
+  .filterBounds(AOI).filterDate(START, END)
+  .filter(ee.Filter.lte('CLOUDY_PIXEL_PERCENTAGE',20))
+  .map(s2Mask);
+var s2med = s2.median().clip(AOI);
+var ndti = s2med.normalizedDifference(['B4','B3']).rename('NDTI');  // (Red-Green)/(Red+Green)
+
+// 2.4 HYCOM marine variables (surface layer)
+var hyTS = ee.ImageCollection('HYCOM/sea_temp_salinity').filterDate(START, END).mean().clip(AOI);
+var seaT = hyTS.select('water_temp_0').multiply(0.001).add(20).rename('SeaTemp_C'); //changes made
+var sal  = hyTS.select('salinity_0').rename('Sal_psu'); //changes made
+
+var hyUV = ee.ImageCollection('HYCOM/sea_water_velocity').filterDate(START, END).mean().clip(AOI);
+var u = hyUV.select('velocity_u_0').multiply(0.001); //eastward
+var v = hyUV.select('velocity_v_0').multiply(0.001); //northward
+var speed = u.hypot(v).rename('Current_mps');
+var dir   = v.atan2(u).multiply(180/Math.PI).rename('CurrentDir_deg'); //changes made
+
+// 2.5 Bathymetry (ETOPO1) -> positive depths in ocean (m), 0 on land
+var etopo = ee.Image('NOAA/NGDC/ETOPO1').select('bedrock').clip(AOI); //Simply fetch the bedrock parameter(in meters) 
+var depth = etopo.lt(0).multiply(etopo.multiply(-1)).rename('Depth_m');
+
+// 2.6 DO saturation (mg/L) via Garcia & Gordon (1992) from seaT & sal
+function DO_saturation_umolkg(tempC, salPSU) {
+  var Ts = tempC.add(273.15).divide(100.0);
+  var A0=2.00907, A1=3.22014, A2=4.05010, A3=4.94457, A4=-0.256847, A5=3.88767;
+  var B0=-0.00624523, B1=-0.00737614, B2=-0.0103410, B3=-0.00817083;
+  var C0=-0.000000488682;
+  var lnC = ee.Image(A0)
+    .add(ee.Image(A1).divide(Ts))
+    .add(ee.Image(A2).multiply(Ts.log()))
+    .add(ee.Image(A3).multiply(Ts))
+    .add(ee.Image(A4).multiply(Ts.pow(2)))
+    .add(ee.Image(A5).multiply(Ts.pow(3)))
+    .add( salPSU.multiply( ee.Image(B0).add(ee.Image(B1).divide(Ts)).add(ee.Image(B2).multiply(Ts)).add(ee.Image(B3).multiply(Ts.pow(2))) ))
+    .add( ee.Image(C0).multiply(salPSU.pow(2)) );
+  return lnC.exp().rename('DO_umolkg');
+}
+var DO_umolkg = DO_saturation_umolkg(seaT, sal);
+var DO_mgL = DO_umolkg.multiply(31.998).divide(1000).multiply(1.025).rename('DO_mgL'); //changes made 
+ 
+// 2.7 Optional pH
+// var pH = PH_IMAGE.clip(AOI);
+
+
+/*** 3) CRITERIA: THRESHOLDS **************************************************
+ * Edit these to your logic. Each becomes a boolean 0/1 image.
+ * Tip: Keep approx 6–8 criteria ON if you use STRICT_ABSOLUTE=true.
+ ******************************************************************************/
+
+// Rationale placeholders (customize later):
+// - Temp: 20–32 °C favorable
+// - Rain: > 800 mm in period
+// - Turbidity: NDTI > 0.1 (more suspended matter)
+// - Salinity: < 1 psu (fresh/brackish edges); HYCOM covers oceans
+// - Currents: < 0.5 m/s (stagnant/slow water)
+// - Depth:   < 10 m (nearshore/shallow)
+// - DO sat:  4–9 mg/L (moderate oxygen; generic range)
+// - pH:      6.5–8.5 (generic aquatic range)
+
+var critList = [];
+var validList = [];
+
+function addCrit(useIt, imgBool, validMask, name){
+  if(!useIt) return;
+  critList.push(imgBool.rename(name));
+  validList.push(validMask.rename(name + '_valid'));
+}
+
+// TEMP
+var tempValid = airT.mask().rename('tempValid');
+var tempOK = airT.gte(20).and(airT.lte(32)).rename('TEMP_ok');
+addCrit(USE_TEMP, tempOK, tempValid, 'TEMP');
+
+// RAIN
+var rainValid = rain.mask().rename('rainValid');
+var rainOK = rain.gt(800).rename('RAIN_ok');
+addCrit(USE_RAIN, rainOK, rainValid, 'RAIN');
+
+// TURBIDITY (NDTI)
+var ndtiValid = ndti.mask().rename('ndtiValid');
+var turbOK = ndti.lt(0.3).rename('TURB_ok'); //changes made
+addCrit(USE_TURBIDITY, turbOK, ndtiValid, 'TURB');
+
+// SALINITY (marine)
+var salValid = sal.mask().rename('salValid');
+var salOK = sal.lt(1.0).rename('SAL_ok');  // fresh/very low salinity edge
+addCrit(USE_SALINITY, salOK, salValid, 'SAL');
+
+// CURRENTS (marine)
+var curValid = speed.mask().rename('curValid');
+var curOK = speed.lt(0.5).rename('CUR_ok');
+addCrit(USE_CURRENTS, curOK, curValid, 'CUR');
+
+// DEPTH (marine)
+var depthValid = depth.mask().updateMask(depth.gt(0)).rename('depthValid'); // ocean-only
+var depthOK = depth.gt(0).and(depth.lte(10)).rename('DEPTH_ok');
+addCrit(USE_DEPTH, depthOK, depthValid, 'DEPTH');
+
+// DO saturation (marine)
+var doValid = DO_mgL.mask().rename('doValid');
+var doOK = DO_mgL.gte(4).and(DO_mgL.lte(9)).rename('DO_ok');
+addCrit(USE_DO_SAT, doOK, doValid, 'DO');
+
+// pH (optional)
+// if (USE_PH) {
+//   var phValid = pH.mask().rename('phValid');
+//   var phOK = pH.gte(6.5).and(pH.lte(8.5)).rename('PH_ok');
+//   addCrit(USE_PH, phOK, phValid, 'PH');
+// }
+
+// new added to check fallback
+if (critList.length === 0) {
+  throw 'No criteria enabled. Please enable at least one USE_* criteria.';
+}
+
+// Pack
+var critImg = ee.ImageCollection(critList).toBands().gt(0); // 1/0
+var validImg = ee.ImageCollection(validList).toBands().gt(0);
+
+// Counts
+var critCount = critImg.reduce(ee.Reducer.sum()).rename('criteria_met');
+var validCount = validImg.reduce(ee.Reducer.sum()).rename('criteria_valid');
+
+// Decision
+var greenStrict = critCount.gt(5);
+var validDenom = validCount.where(validCount.eq(0), ee.Image.constant(1));
+var greenRelative = critCount.divide(validDenom).gt(0.6).and(validCount.gte(4));
+
+// Final classification
+var isGreen = ee.Image(STRICT_ABSOLUTE ? greenStrict : greenRelative).rename('GREEN');
+var ruleMap = isGreen.updateMask(isGreen).multiply(1);
+var palette = ['red','green'];
+var display = isGreen.where(isGreen.eq(0), 0).visualize({min:0, max:1, palette: palette});
+
+// Add layers
+Map.addLayer(critCount.clip(AOI), {min:0, max:8, palette:['white','yellow','orange','red']}, '#Criteria Met');
+Map.addLayer(validCount.clip(AOI), {min:0, max:8, palette:['white','lightblue','blue','navy']}, '#Criteria Valid');
+Map.addLayer(isGreen.clip(AOI), {min:0, max:1, palette: palette}, 'Mechanism Rule: GREEN if >5');
+
+// Quick stats
+print('Criteria Met (mean over AOI):', critCount.reduceRegion({reducer: ee.Reducer.mean(), geometry: AOI, scale: 5000, maxPixels: 1e13}));
+print('Valid Criteria (mean over AOI):', validCount.reduceRegion({reducer: ee.Reducer.mean(), geometry: AOI, scale: 5000, maxPixels: 1e13}));
+
+// Export (optional)
+Export.image.toDrive({
+  image: isGreen.clip(AOI).rename('GreenIfMoreThan5'),
+  description: 'MalariaMechanism_GreenIfMoreThan5',
+  region: AOI,
+  scale: 1000,
+  maxPixels: 1e13
+});
+
+
+/*** ADMINISTRATIVE BOUNDARIES: WEST BENGAL & BANGLADESH ***********************/
+
+// Load FAO GAUL administrative boundaries (Level 1 for states/provinces)
+var admin1 = ee.FeatureCollection('FAO/GAUL/2015/level1');
+
+// Filter for West Bengal (India)
+var westBengal = admin1.filter(ee.Filter.and(
+  ee.Filter.eq('ADM0_NAME', 'India'),
+  ee.Filter.eq('ADM1_NAME', 'West Bengal')
+));
+
+// Load country boundaries (Level 0) for Bangladesh
+var admin0 = ee.FeatureCollection('FAO/GAUL/2015/level0');
+var bangladesh = admin0.filter(ee.Filter.eq('ADM0_NAME', 'Bangladesh'));
+
+// Add boundary layers with distinct colors
+Map.addLayer(westBengal, {color: 'black'}, 'West Bengal Boundary', true, 0.8);
+Map.addLayer(bangladesh, {color: 'black'}, 'Bangladesh Boundary', true, 0.8);
+
+// Optional: Add boundary outlines only (no fill)
+var emptyStyle = ee.Image().byte().paint({
+  featureCollection: westBengal,
+  color: 1,
+  width: 3
+});
+Map.addLayer(emptyStyle, {palette: ['000000']}, 'West Bengal Outline');
+
+var bangladeshOutline = ee.Image().byte().paint({
+  featureCollection: bangladesh,
+  color: 1,
+  width: 3
+});
+Map.addLayer(bangladeshOutline, {palette: ['00000']}, 'Bangladesh Outline');
