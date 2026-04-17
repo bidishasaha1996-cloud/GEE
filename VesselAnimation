@@ -1,0 +1,248 @@
+# =========================
+# 1) Install dependencies
+# =========================
+!pip -q install geopandas fiona shapely pyproj
+
+import xml.etree.ElementTree as ET
+import numpy as np
+import matplotlib.pyplot as plt
+from matplotlib.animation import FuncAnimation, PillowWriter
+from IPython.display import Image, display
+from google.colab import files
+import geopandas as gpd
+import os
+
+# =========================
+# 2) Upload MULTIPLE KML files
+# =========================
+uploaded = files.upload()
+kml_files = [k for k in uploaded.keys() if k.lower().endswith(".kml")]
+
+if not kml_files:
+    raise ValueError("Please upload at least one .kml file.")
+
+print("Uploaded KML files:")
+for f in kml_files:
+    print("-", f)
+
+# =========================
+# 3) Read first LineString + optional name from each KML
+# =========================
+def read_kml_linestring(kml_file):
+    ns = {'kml': 'http://www.opengis.net/kml/2.2'}
+    root = ET.parse(kml_file).getroot()
+
+    coords_node = root.find('.//kml:LineString/kml:coordinates', ns)
+    if coords_node is None:
+        raise ValueError(f"No LineString found in {kml_file}.")
+
+    # Try to read placemark name
+    name_node = root.find('.//kml:Placemark/kml:name', ns)
+    if name_node is not None and name_node.text:
+        vessel_name = name_node.text.strip()
+    else:
+        vessel_name = os.path.splitext(os.path.basename(kml_file))[0]
+
+    lon, lat = [], []
+    for item in coords_node.text.strip().split():
+        x, y, *_ = item.split(',')
+        lon.append(float(x))
+        lat.append(float(y))
+
+    return vessel_name, np.array(lon), np.array(lat)
+
+# =========================
+# 4) Smooth interpolation
+# =========================
+def interpolate_path(lon, lat, n_frames=260):
+    mean_lat = np.deg2rad(np.mean(lat))
+    x = lon * np.cos(mean_lat)
+    y = lat.copy()
+
+    seg = np.hypot(np.diff(x), np.diff(y))
+    dist = np.concatenate(([0], np.cumsum(seg)))
+
+    if dist[-1] == 0:
+        return np.full(n_frames, lon[0]), np.full(n_frames, lat[0])
+
+    dist_new = np.linspace(0, dist[-1], n_frames)
+    x_new = np.interp(dist_new, dist, x)
+    y_new = np.interp(dist_new, dist, y)
+
+    lon_new = x_new / np.cos(mean_lat)
+    lat_new = y_new
+    return lon_new, lat_new
+
+# =========================
+# 5) Arrow heading
+# =========================
+def heading_deg(lon, lat, i):
+    if i >= len(lon) - 1:
+        i = len(lon) - 2
+    angle = np.degrees(np.arctan2(lat[i+1] - lat[i], lon[i+1] - lon[i]))
+    return angle
+
+# =========================
+# 6) Load all routes
+# =========================
+routes = []
+all_lon = []
+all_lat = []
+
+# choose one common animation length
+N_FRAMES = 260
+
+for kml in kml_files:
+    vessel_name, lon, lat = read_kml_linestring(kml)
+    lon_s, lat_s = interpolate_path(lon, lat, n_frames=N_FRAMES)
+
+    routes.append({
+        "name": vessel_name,
+        "lon": lon,
+        "lat": lat,
+        "lon_s": lon_s,
+        "lat_s": lat_s
+    })
+
+    all_lon.extend(lon.tolist())
+    all_lat.extend(lat.tolist())
+
+all_lon = np.array(all_lon)
+all_lat = np.array(all_lat)
+
+# =========================
+# 7) Load clean world map
+# =========================
+world_url = "https://naturalearth.s3.amazonaws.com/50m_cultural/ne_50m_admin_0_countries.zip"
+world = gpd.read_file(world_url)
+
+# =========================
+# 8) Auto-zoom to ALL routes
+# =========================
+minx, maxx = all_lon.min(), all_lon.max()
+miny, maxy = all_lat.min(), all_lat.max()
+
+dx = maxx - minx
+dy = maxy - miny
+
+pad_x = max(dx * 0.25, 1.2)
+pad_y = max(dy * 0.30, 0.8)
+
+xlim = (minx - pad_x, maxx + pad_x)
+ylim = (miny - pad_y, maxy + pad_y)
+
+world_crop = world.cx[xlim[0]:xlim[1], ylim[0]:ylim[1]]
+
+# =========================
+# 9) Figure
+# =========================
+fig, ax = plt.subplots(figsize=(7, 7), dpi=150)
+fig.patch.set_facecolor("white")
+ax.set_facecolor("white")
+fig.subplots_adjust(left=0, right=1, bottom=0, top=1)
+
+# clean land background
+world_crop.plot(
+    ax=ax,
+    color="#e8e8e8",
+    edgecolor="#cfcfcf",
+    linewidth=0.35,
+    zorder=1
+)
+
+# =========================
+# 10) Colours
+# =========================
+base_colors = [
+    "#0b6cfb", "#ef4444", "#10b981", "#f59e0b", "#8b5cf6",
+    "#ec4899", "#14b8a6", "#f97316", "#22c55e", "#64748b"
+]
+
+# repeat colours if more vessels than colours
+colors = [base_colors[i % len(base_colors)] for i in range(len(routes))]
+
+# =========================
+# 11) Draw route skeletons + animated objects
+# =========================
+trail_lines = []
+vessel_markers = []
+
+for idx, route in enumerate(routes):
+    color = colors[idx]
+
+    # faint full route
+    ax.plot(
+        route["lon"],
+        route["lat"],
+        color=color,
+        linewidth=1.8,
+        alpha=0.18,
+        solid_capstyle="round",
+        zorder=2
+    )
+
+    # travelled path
+    trail, = ax.plot(
+        [], [],
+        color=color,
+        linewidth=3.0,
+        solid_capstyle="round",
+        zorder=3
+    )
+    trail_lines.append(trail)
+
+    # vessel arrow
+    vessel, = ax.plot(
+        [], [],
+        linestyle="",
+        marker=(3, 0, 0),
+        markersize=15,
+        color=color,
+        zorder=4
+    )
+    vessel_markers.append(vessel)
+
+ax.set_xlim(xlim)
+ax.set_ylim(ylim)
+ax.set_aspect("equal", adjustable="box")
+ax.axis("off")
+
+# =========================
+# 12) Animation update
+# =========================
+def update(i):
+    artists = []
+
+    for idx, route in enumerate(routes):
+        lon_s = route["lon_s"]
+        lat_s = route["lat_s"]
+
+        trail_lines[idx].set_data(lon_s[:i+1], lat_s[:i+1])
+        vessel_markers[idx].set_data([lon_s[i]], [lat_s[i]])
+        vessel_markers[idx].set_marker((3, 0, heading_deg(lon_s, lat_s, i) - 90))
+
+        artists.append(trail_lines[idx])
+        artists.append(vessel_markers[idx])
+
+    return artists
+
+ani = FuncAnimation(
+    fig,
+    update,
+    frames=N_FRAMES,
+    interval=55,
+    blit=False
+)
+
+# =========================
+# 13) Save GIF
+# =========================
+out_gif = "multi_vessel_animation.gif"
+ani.save(out_gif, writer=PillowWriter(fps=20))
+plt.close(fig)
+
+# =========================
+# 14) Preview + download
+# =========================
+display(Image(filename=out_gif))
+files.download(out_gif)
