@@ -1,0 +1,231 @@
+# =========================
+# BEFORE / AFTER JUXTAPOSE GIF MAKER
+# Google Colab-ready
+# =========================
+
+!pip -q install pillow imageio
+
+import os
+import io
+import math
+import base64
+import imageio.v2 as imageio
+
+from PIL import Image, ImageOps, ImageDraw
+from google.colab import files
+from IPython.display import display, HTML
+
+# -------------------------
+# SETTINGS
+# -------------------------
+OUTPUT_GIF_NAME = "before_after_juxtapose.gif"
+
+# Output size of the GIF
+OUTPUT_WIDTH = 1200
+
+# Animation controls
+FPS = 24
+CYCLE_DURATION_SEC = 4.0   # total duration for left->right->left
+LINE_WIDTH = 3             # thin white divider
+HOLD_AT_EDGES_FRAMES = 4   # optional slight pause at the ends
+
+# Styling
+ADD_SHADOW_TO_LINE = False  # set True if you want a faint shadow beside the white line
+
+
+# -------------------------
+# HELPERS
+# -------------------------
+def fit_image_to_canvas(img, target_w, target_h):
+    """
+    Resize image to completely fill the canvas (cover),
+    then center-crop it to exact size.
+    """
+    img = img.convert("RGB")
+    scale = max(target_w / img.width, target_h / img.height)
+    new_w = int(img.width * scale)
+    new_h = int(img.height * scale)
+    img = img.resize((new_w, new_h), Image.LANCZOS)
+
+    left = (new_w - target_w) // 2
+    top = (new_h - target_h) // 2
+    right = left + target_w
+    bottom = top + target_h
+
+    return img.crop((left, top, right, bottom))
+
+
+def build_divider_positions(width, fps=24, cycle_duration=4.0, hold_frames=0):
+    """
+    Create smooth positions for divider:
+    left -> right -> left, continuous loop.
+    """
+    total_frames = max(2, int(fps * cycle_duration))
+
+    # Half cycle forward, half cycle backward
+    half = total_frames // 2
+    if half < 2:
+        half = 2
+
+    # Smooth easing
+    def ease_in_out(t):
+        return 0.5 * (1 - math.cos(math.pi * t))
+
+    forward = []
+    for i in range(half):
+        t = i / (half - 1)
+        x = int(ease_in_out(t) * width)
+        forward.append(x)
+
+    backward = list(reversed(forward[1:-1]))  # avoid duplicate edge frames
+    positions = forward + backward
+
+    # Optional tiny pause at edges
+    if hold_frames > 0:
+        left_hold = [0] * hold_frames
+        right_hold = [width] * hold_frames
+        positions = left_hold + positions[:half] + right_hold + positions[half:]
+
+    return positions
+
+
+def make_juxtapose_frame(before_img, after_img, divider_x, line_width=3, add_shadow=False):
+    """
+    Frame logic:
+    left side = before
+    right side = after
+    white line marks the split.
+    """
+    w, h = before_img.size
+
+    frame = Image.new("RGB", (w, h))
+    frame.paste(before_img, (0, 0))
+
+    # Clip and paste the right side from "after"
+    divider_x = max(0, min(w, divider_x))
+    if divider_x < w:
+        right_part = after_img.crop((divider_x, 0, w, h))
+        frame.paste(right_part, (divider_x, 0))
+
+    draw = ImageDraw.Draw(frame)
+
+    # Optional faint shadow for better visibility
+    if add_shadow:
+        shadow_x = divider_x + 1
+        draw.rectangle(
+            [shadow_x, 0, shadow_x + line_width, h],
+            fill=(80, 80, 80)
+        )
+
+    # Thin white divider line
+    draw.rectangle(
+        [divider_x - line_width // 2, 0, divider_x + line_width // 2, h],
+        fill=(255, 255, 255)
+    )
+
+    return frame
+
+
+# -------------------------
+# STEP 1: UPLOAD 2 IMAGES
+# -------------------------
+print("Upload EXACTLY 2 images: first = BEFORE, second = AFTER")
+uploaded = files.upload()
+
+uploaded_names = list(uploaded.keys())
+if len(uploaded_names) != 2:
+    raise ValueError(f"Please upload exactly 2 images. You uploaded {len(uploaded_names)} file(s).")
+
+before_name = uploaded_names[0]
+after_name = uploaded_names[1]
+
+print(f"\nBefore image: {before_name}")
+print(f"After image : {after_name}")
+
+
+# -------------------------
+# STEP 2: LOAD IMAGES
+# -------------------------
+before_raw = Image.open(io.BytesIO(uploaded[before_name])).convert("RGB")
+after_raw = Image.open(io.BytesIO(uploaded[after_name])).convert("RGB")
+
+# Determine output height from BEFORE image aspect ratio after fixing width
+output_height = int(before_raw.height * (OUTPUT_WIDTH / before_raw.width))
+
+before_img = fit_image_to_canvas(before_raw, OUTPUT_WIDTH, output_height)
+after_img = fit_image_to_canvas(after_raw, OUTPUT_WIDTH, output_height)
+
+
+# -------------------------
+# STEP 3: BUILD FRAMES
+# -------------------------
+positions = build_divider_positions(
+    width=OUTPUT_WIDTH,
+    fps=FPS,
+    cycle_duration=CYCLE_DURATION_SEC,
+    hold_frames=HOLD_AT_EDGES_FRAMES
+)
+
+frames = []
+for x in positions:
+    frame = make_juxtapose_frame(
+        before_img,
+        after_img,
+        divider_x=x,
+        line_width=LINE_WIDTH,
+        add_shadow=ADD_SHADOW_TO_LINE
+    )
+    frames.append(frame)
+
+
+# -------------------------
+# STEP 4: SAVE GIF
+# -------------------------
+# GIF frame duration in milliseconds
+frame_duration_ms = int(1000 / FPS)
+
+frames[0].save(
+    OUTPUT_GIF_NAME,
+    save_all=True,
+    append_images=frames[1:],
+    duration=frame_duration_ms,
+    loop=0,
+    optimize=True
+)
+
+print(f"\nGIF saved as: {OUTPUT_GIF_NAME}")
+
+
+# -------------------------
+# STEP 5: PREVIEW IN COLAB
+# -------------------------
+with open(OUTPUT_GIF_NAME, "rb") as f:
+    gif_b64 = base64.b64encode(f.read()).decode("utf-8")
+
+display(HTML(f"""
+<div style="max-width:900px; margin:20px auto; text-align:center;">
+  <img src="data:image/gif;base64,{gif_b64}" style="max-width:100%; height:auto; border-radius:8px;" />
+</div>
+"""))
+
+
+# -------------------------
+# STEP 6: AUTO-DOWNLOAD GIF
+# -------------------------
+files.download(OUTPUT_GIF_NAME)
+
+
+# -------------------------
+# STEP 7: CMS EMBED CODE
+# -------------------------
+print("\n=== UNIVERSAL CMS EMBED CODE ===")
+print("""
+1) Upload the downloaded GIF to your CMS/media library/CDN.
+2) Replace YOUR_GIF_URL_HERE with the final public URL.
+
+HTML:
+<img src="YOUR_GIF_URL_HERE" alt="Before and after comparison" style="max-width:100%;height:auto;display:block;" loading="lazy" />
+
+Markdown:
+![Before and after comparison](YOUR_GIF_URL_HERE)
+""")
