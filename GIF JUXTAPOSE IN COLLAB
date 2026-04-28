@@ -1,6 +1,6 @@
 # =========================
 # BEFORE / AFTER JUXTAPOSE GIF MAKER
-# Reduced flicker / better quality
+# Higher quality / original resolution preserved
 # Google Colab-ready
 # =========================
 
@@ -18,9 +18,9 @@ from IPython.display import display, HTML
 # SETTINGS
 # -------------------------
 OUTPUT_GIF_NAME = "before_after_juxtapose_fixed.gif"
+OUTPUT_WEBP_NAME = "before_after_juxtapose_fixed.webp"   # high-quality alternative
 
-# Keep None to preserve maximum possible quality without forced resizing
-# Set a number like 1600 only if you want to cap output width
+# Keep None to preserve full original size
 MAX_OUTPUT_WIDTH = None
 
 FPS = 20
@@ -28,8 +28,8 @@ CYCLE_DURATION_SEC = 4.0
 LINE_WIDTH = 2
 HOLD_AT_EDGES_FRAMES = 4
 
-PAD_COLOR = (0, 0, 0)   # used only if images have different aspect ratios
-GIF_COLORS = 255
+PAD_COLOR = (0, 0, 0)
+GIF_COLORS = 256   # max allowed for GIF
 
 
 # -------------------------
@@ -38,11 +38,14 @@ GIF_COLORS = 255
 def prepare_image_no_upscale(img, canvas_w, canvas_h, pad_color=(0, 0, 0)):
     """
     Fit image inside canvas without cropping and without upscaling.
-    Pads if needed so both images share identical dimensions.
+    Preserves original image resolution as much as possible.
     """
     img = img.convert("RGB")
     img_copy = img.copy()
-    img_copy.thumbnail((canvas_w, canvas_h), Image.LANCZOS)
+
+    # Only shrink if image is bigger than canvas
+    if img_copy.width > canvas_w or img_copy.height > canvas_h:
+        img_copy.thumbnail((canvas_w, canvas_h), Image.LANCZOS)
 
     canvas = Image.new("RGB", (canvas_w, canvas_h), pad_color)
     x = (canvas_w - img_copy.width) // 2
@@ -95,9 +98,9 @@ def make_juxtapose_frame(before_img, after_img, divider_x, line_width=2):
     return frame
 
 
-def build_master_palette(before_img, after_img, positions, line_width, sample_count=8):
+def build_master_palette(before_img, after_img, positions, line_width, sample_count=12):
     """
-    Build one global palette from a few representative frames,
+    Build one global palette from representative frames
     so colours remain stable across the entire GIF.
     """
     w, h = before_img.size
@@ -114,7 +117,6 @@ def build_master_palette(before_img, after_img, positions, line_width, sample_co
         sample_frame = make_juxtapose_frame(before_img, after_img, x, line_width=line_width)
         strip.paste(sample_frame, (i * w, 0))
 
-    # One shared palette for all frames
     master_palette = strip.quantize(
         colors=GIF_COLORS,
         method=Image.MEDIANCUT,
@@ -153,11 +155,13 @@ print(f"After image : {after_name}")
 before_raw = Image.open(io.BytesIO(uploaded[before_name])).convert("RGB")
 after_raw = Image.open(io.BytesIO(uploaded[after_name])).convert("RGB")
 
-# Use the smaller common canvas to avoid upscaling either image
-canvas_w = min(before_raw.width, after_raw.width)
-canvas_h = min(before_raw.height, after_raw.height)
+# IMPORTANT FIX:
+# Use the larger canvas instead of the smaller one
+# so original resolution is retained as much as possible
+canvas_w = max(before_raw.width, after_raw.width)
+canvas_h = max(before_raw.height, after_raw.height)
 
-# Optional cap, but never upscale
+# Optional cap, but never upscale beyond original intent
 if MAX_OUTPUT_WIDTH is not None and canvas_w > MAX_OUTPUT_WIDTH:
     scale = MAX_OUTPUT_WIDTH / canvas_w
     canvas_w = int(canvas_w * scale)
@@ -188,20 +192,20 @@ for x in positions:
         )
     )
 
-# Build one stable palette for all frames
+# Build one stable palette for GIF
 master_palette = build_master_palette(
     before_img,
     after_img,
     positions,
     line_width=LINE_WIDTH,
-    sample_count=8
+    sample_count=12
 )
 
 gif_frames = [convert_with_master_palette(frame, master_palette) for frame in rgb_frames]
 
 
 # -------------------------
-# STEP 4: SAVE GIF
+# STEP 4A: SAVE GIF
 # -------------------------
 frame_duration_ms = int(1000 / FPS)
 
@@ -211,11 +215,29 @@ gif_frames[0].save(
     append_images=gif_frames[1:],
     duration=frame_duration_ms,
     loop=0,
-    optimize=False,   # IMPORTANT: reduces flicker/shimmer
-    disposal=2        # IMPORTANT: cleaner frame redraw
+    optimize=False,
+    disposal=2
 )
 
 print(f"\nGIF saved as: {OUTPUT_GIF_NAME}")
+
+
+# -------------------------
+# STEP 4B: SAVE HIGH-QUALITY WEBP
+# -------------------------
+# This preserves quality much better than GIF
+rgb_frames[0].save(
+    OUTPUT_WEBP_NAME,
+    save_all=True,
+    append_images=rgb_frames[1:],
+    duration=frame_duration_ms,
+    loop=0,
+    lossless=True,
+    quality=100,
+    method=6
+)
+
+print(f"High-quality animated WebP saved as: {OUTPUT_WEBP_NAME}")
 
 
 # -------------------------
@@ -225,14 +247,17 @@ with open(OUTPUT_GIF_NAME, "rb") as f:
     gif_b64 = base64.b64encode(f.read()).decode("utf-8")
 
 display(HTML(f"""
-<div style="max-width:900px; margin:20px auto; text-align:center;">
-  <p style="font-family:Arial; color:#666;">Preview (browser preview may still look slightly harsher than downloaded file)</p>
+<div style="max-width:1100px; margin:20px auto; text-align:center;">
+  <p style="font-family:Arial; color:#666;">
+    GIF preview (for compatibility). For best quality, use the WebP file.
+  </p>
   <img src="data:image/gif;base64,{gif_b64}" style="max-width:100%; height:auto; border-radius:8px;" />
 </div>
 """))
 
 
 # -------------------------
-# STEP 6: AUTO-DOWNLOAD GIF
+# STEP 6: AUTO-DOWNLOAD
 # -------------------------
 files.download(OUTPUT_GIF_NAME)
+files.download(OUTPUT_WEBP_NAME)
