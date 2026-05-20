@@ -1,0 +1,118 @@
+import bpy
+
+# ---------------- SETTINGS ----------------
+GLOW_COLOR = (1.0, 0.45, 0.05, 1.0)   # glow colour only
+PULSE_LENGTH = 25                      # lower = faster pulse
+GLOW_ALPHA = 0.28                      # glow visibility
+GLOW_STRENGTH = 6.0                    # glow intensity
+START_FRAME = bpy.context.scene.frame_current
+# ------------------------------------------
+
+
+def clean_old_glow_objects():
+    """Remove glow duplicates created by earlier versions of this script."""
+    for obj in list(bpy.data.objects):
+        if obj.get("pulse_glow_duplicate") or obj.get("no_move_pulse_glow"):
+            bpy.data.objects.remove(obj, do_unlink=True)
+
+
+def setup_transparent_emission_material(name):
+    mat = bpy.data.materials.new(name)
+    mat.use_nodes = True
+
+    # Blender 4.x / 5.x compatibility
+    if hasattr(mat, "blend_method"):
+        mat.blend_method = "BLEND"
+    if hasattr(mat, "surface_render_method"):
+        mat.surface_render_method = "BLENDED"
+
+    mat.show_transparent_back = True
+
+    nodes = mat.node_tree.nodes
+    links = mat.node_tree.links
+    nodes.clear()
+
+    output = nodes.new(type="ShaderNodeOutputMaterial")
+    mix = nodes.new(type="ShaderNodeMixShader")
+    transparent = nodes.new(type="ShaderNodeBsdfTransparent")
+    emission = nodes.new(type="ShaderNodeEmission")
+
+    emission.inputs["Color"].default_value = GLOW_COLOR
+    emission.inputs["Strength"].default_value = 0.0
+    mix.inputs[0].default_value = 0.0
+
+    links.new(transparent.outputs[0], mix.inputs[1])
+    links.new(emission.outputs[0], mix.inputs[2])
+    links.new(mix.outputs[0], output.inputs[0])
+
+    # Pulse driver: off → glow → off → repeat
+    alpha_driver = mix.inputs[0].driver_add("default_value").driver
+    alpha_driver.type = "SCRIPTED"
+    alpha_driver.expression = (
+        f"{GLOW_ALPHA} * (0.5 - 0.5*cos(6.2831853*((frame-{START_FRAME})/{PULSE_LENGTH})))"
+    )
+
+    strength_driver = emission.inputs["Strength"].driver_add("default_value").driver
+    strength_driver.type = "SCRIPTED"
+    strength_driver.expression = (
+        f"{GLOW_STRENGTH} * (0.5 - 0.5*cos(6.2831853*((frame-{START_FRAME})/{PULSE_LENGTH})))"
+    )
+
+    return mat
+
+
+def add_no_move_glow(original):
+    if original.type in {"CAMERA", "LIGHT", "EMPTY"}:
+        print(f"Skipped {original.name}: not a visible mesh/text object")
+        return
+
+    # Duplicate object, but DO NOT scale or move it
+    glow = original.copy()
+
+    if original.data:
+        glow.data = original.data.copy()
+
+    glow.animation_data_clear()
+    glow.name = original.name + "_NO_MOVE_PULSE_GLOW"
+    glow["no_move_pulse_glow"] = True
+    glow["pulse_glow_duplicate"] = True
+
+    # Link to same collection
+    collection = original.users_collection[0] if original.users_collection else bpy.context.collection
+    collection.objects.link(glow)
+
+    # EXACT same world transform
+    glow.matrix_world = original.matrix_world.copy()
+
+    # Follow original exactly, without becoming its child
+    constraint = glow.constraints.new(type="COPY_TRANSFORMS")
+    constraint.target = original
+    constraint.owner_space = "WORLD"
+    constraint.target_space = "WORLD"
+
+    # Give only the duplicate the glow material
+    glow_mat = setup_transparent_emission_material(original.name + "_Pulse_Glow_Material")
+
+    if glow.data and hasattr(glow.data, "materials"):
+        glow.data.materials.clear()
+        glow.data.materials.append(glow_mat)
+    else:
+        glow.active_material = glow_mat
+
+    # Prevent accidental selection/movement
+    glow.hide_select = True
+
+    print(f"Glow added to: {original.name}")
+
+
+selected_objects = bpy.context.selected_objects
+
+if not selected_objects:
+    raise Exception("Select the object you want to glow first.")
+
+clean_old_glow_objects()
+
+for obj in selected_objects:
+    add_no_move_glow(obj)
+
+print("Done. The original object was not moved, scaled, recoloured, or edited.")
