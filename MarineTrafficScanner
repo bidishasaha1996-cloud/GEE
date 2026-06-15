@@ -1,0 +1,898 @@
+(async () => {
+  const CONFIG = {
+    WAIT_MS: 650,
+    HORIZONTAL_STEP_RATIO: 0.55,
+    VERTICAL_STEP_RATIO: 0.55,
+    MAX_VERTICAL_PASSES: 1200,
+    MAX_HORIZONTAL_PASSES: 100
+  };
+
+  const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+
+  const clean = value =>
+    String(value ?? "")
+      .replace(/\u00a0/g, " ")
+      .replace(/\s+/g, " ")
+      .trim();
+
+  const visible = element => {
+    if (!element) return false;
+
+    const rect = element.getBoundingClientRect();
+    const style = getComputedStyle(element);
+
+    return (
+      rect.width > 0 &&
+      rect.height > 0 &&
+      style.display !== "none" &&
+      style.visibility !== "hidden" &&
+      style.opacity !== "0"
+    );
+  };
+
+  const normaliseHeader = value =>
+    clean(value)
+      .toLowerCase()
+      .replace(/[_-]+/g, " ")
+      .replace(/[^\w\s]/g, "")
+      .replace(/\s+/g, " ")
+      .trim();
+
+  const detectField = value => {
+    const text = normaliseHeader(value);
+
+    if (
+      text === "vessel name" ||
+      text === "vesselname" ||
+      text === "ship name"
+    ) {
+      return "vessel_name";
+    }
+
+    if (
+      text === "imo" ||
+      text === "imo number" ||
+      text === "imonumber"
+    ) {
+      return "imo";
+    }
+
+    if (
+      text === "latitude" ||
+      text === "lat" ||
+      text.includes("position latitude")
+    ) {
+      return "latitude";
+    }
+
+    if (
+      text === "longitude" ||
+      text === "lon" ||
+      text === "lng" ||
+      text.includes("position longitude")
+    ) {
+      return "longitude";
+    }
+
+    return null;
+  };
+
+  const extractIMO = value => {
+    const text = clean(value);
+
+    /*
+     * IMO numbers contain exactly seven digits.
+     * This prevents dates, ETAs and coordinates from being captured.
+     */
+    const match = text.match(/(?:^|\D)(\d{7})(?:\D|$)/);
+
+    return match ? match[1] : "";
+  };
+
+  const extractCoordinate = (value, type) => {
+    const text = clean(value);
+
+    if (!text) return "";
+
+    /*
+     * Reject timestamps and dates.
+     */
+    if (
+      /\bUTC\b/i.test(text) ||
+      /\d{4}-\d{2}-\d{2}/.test(text) ||
+      /\d{2}:\d{2}/.test(text)
+    ) {
+      return "";
+    }
+
+    /*
+     * Accept decimal coordinates and values containing N/S/E/W.
+     */
+    const match = text.match(/-?\d+(?:\.\d+)?/);
+
+    if (!match) return "";
+
+    let number = Number(match[0]);
+
+    if (!Number.isFinite(number)) return "";
+
+    if (/\bS\b/i.test(text) || /\bW\b/i.test(text)) {
+      number = -Math.abs(number);
+    }
+
+    if (/\bN\b/i.test(text) || /\bE\b/i.test(text)) {
+      number = Math.abs(number);
+    }
+
+    if (type === "latitude" && Math.abs(number) > 90) {
+      return "";
+    }
+
+    if (type === "longitude" && Math.abs(number) > 180) {
+      return "";
+    }
+
+    return String(number);
+  };
+
+  const extractVesselName = value => {
+    const text = clean(value);
+
+    if (!text) return "";
+
+    if (
+      /^\d+$/.test(text) ||
+      /^\d{4}-\d{2}-\d{2}/.test(text) ||
+      /^IMO\b/i.test(text) ||
+      /^Vessel Name$/i.test(text)
+    ) {
+      return "";
+    }
+
+    return text;
+  };
+
+  /*
+   * Locate horizontal table scroller.
+   */
+  const allElements = [...document.querySelectorAll("body *")];
+
+  const horizontalCandidates = allElements
+    .filter(element => {
+      if (!visible(element)) return false;
+
+      const rect = element.getBoundingClientRect();
+
+      return (
+        rect.width > 500 &&
+        element.scrollWidth > element.clientWidth + 80
+      );
+    })
+    .map(element => {
+      const text = clean(element.innerText).slice(0, 10000);
+
+      let score =
+        element.scrollWidth -
+        element.clientWidth;
+
+      if (/Vessel Name/i.test(text)) score += 1000000;
+      if (/\bIMO\b/i.test(text)) score += 500000;
+      if (/Destination Port/i.test(text)) score += 250000;
+      if (/Total Rows/i.test(text)) score += 100000;
+
+      return { element, score };
+    })
+    .sort((a, b) => b.score - a.score);
+
+  if (!horizontalCandidates.length) {
+    throw new Error(
+      "Horizontal table scroller not found. Click inside the table and rerun."
+    );
+  }
+
+  const horizontalScroller =
+    horizontalCandidates[0].element;
+
+  /*
+   * Locate the complete table/grid container.
+   */
+  const gridRoot =
+    horizontalScroller.closest(
+      [
+        '[role="grid"]',
+        ".ag-root-wrapper",
+        ".ag-root",
+        ".MuiDataGrid-root",
+        '[class*="DataGrid"]',
+        '[class*="data-grid"]',
+        '[class*="table-container"]',
+        '[class*="TableContainer"]'
+      ].join(",")
+    ) ||
+    horizontalScroller.parentElement?.parentElement ||
+    horizontalScroller;
+
+  /*
+   * Locate vertical table scroller.
+   */
+  const verticalSearchArea = [
+    gridRoot,
+    ...gridRoot.querySelectorAll("*")
+  ];
+
+  const verticalCandidates = verticalSearchArea
+    .filter(element => {
+      if (!visible(element)) return false;
+
+      const rect = element.getBoundingClientRect();
+
+      return (
+        rect.width > 300 &&
+        rect.height > 150 &&
+        element.scrollHeight > element.clientHeight + 80
+      );
+    })
+    .map(element => {
+      const style = getComputedStyle(element);
+
+      let score =
+        element.scrollHeight -
+        element.clientHeight;
+
+      if (element === horizontalScroller) {
+        score += 50000;
+      }
+
+      if (
+        ["auto", "scroll"].includes(style.overflowY) ||
+        ["auto", "scroll"].includes(style.overflow)
+      ) {
+        score += 100000;
+      }
+
+      return { element, score };
+    })
+    .sort((a, b) => b.score - a.score);
+
+  if (!verticalCandidates.length) {
+    throw new Error(
+      "Vertical table scroller not found."
+    );
+  }
+
+  const verticalScroller =
+    verticalCandidates[0].element;
+
+  console.log("Grid root:", gridRoot);
+  console.log("Horizontal scroller:", horizontalScroller);
+  console.log("Vertical scroller:", verticalScroller);
+
+  /*
+   * Get currently displayed column headings.
+   */
+  const getHeaders = () => {
+    const selectors = [
+      '[role="columnheader"]',
+      "th",
+      ".ag-header-cell",
+      ".MuiDataGrid-columnHeader",
+      '[class*="header-cell"]',
+      '[class*="HeaderCell"]'
+    ].join(",");
+
+    let candidates = [
+      ...gridRoot.querySelectorAll(selectors)
+    ];
+
+    /*
+     * Fallback for custom React tables.
+     */
+    const fallback = [
+      ...gridRoot.querySelectorAll("div, span")
+    ].filter(element => {
+      if (!visible(element)) return false;
+
+      const text = clean(element.textContent);
+
+      return (
+        text.length < 50 &&
+        Boolean(detectField(text))
+      );
+    });
+
+    candidates.push(...fallback);
+
+    const rootRect = gridRoot.getBoundingClientRect();
+    const detected = new Map();
+
+    for (const element of candidates) {
+      if (!visible(element)) continue;
+
+      const field = detectField(
+        element.innerText ||
+        element.textContent ||
+        element.getAttribute("aria-label") ||
+        element.getAttribute("data-field") ||
+        element.getAttribute("col-id")
+      );
+
+      if (!field) continue;
+
+      const rect = element.getBoundingClientRect();
+
+      if (
+        rect.bottom < rootRect.top ||
+        rect.top > rootRect.bottom ||
+        rect.right < rootRect.left ||
+        rect.left > rootRect.right
+      ) {
+        continue;
+      }
+
+      const candidate = {
+        field,
+        x: rect.left + rect.width / 2,
+        left: rect.left,
+        right: rect.right,
+        top: rect.top,
+        bottom: rect.bottom,
+        width: rect.width,
+        element
+      };
+
+      const previous = detected.get(field);
+
+      /*
+       * Prefer the smaller and more specific header element.
+       */
+      if (
+        !previous ||
+        candidate.width < previous.width
+      ) {
+        detected.set(field, candidate);
+      }
+    }
+
+    return [...detected.values()];
+  };
+
+  /*
+   * Find visible data rows.
+   */
+  const getRows = () => {
+    const selectors = [
+      ".ag-row",
+      ".MuiDataGrid-row",
+      '[role="row"]',
+      "tbody tr",
+      '[class*="table-row"]',
+      '[class*="TableRow"]'
+    ].join(",");
+
+    const found = new Set(
+      [...gridRoot.querySelectorAll(selectors)]
+    );
+
+    const cellElements = gridRoot.querySelectorAll(
+      [
+        '[role="gridcell"]',
+        '[role="cell"]',
+        ".ag-cell",
+        ".MuiDataGrid-cell",
+        "td"
+      ].join(",")
+    );
+
+    for (const cell of cellElements) {
+      const row =
+        cell.closest(
+          [
+            ".ag-row",
+            ".MuiDataGrid-row",
+            '[role="row"]',
+            "tr",
+            '[class*="table-row"]',
+            '[class*="TableRow"]'
+          ].join(",")
+        );
+
+      if (row) found.add(row);
+    }
+
+    const rootRect = gridRoot.getBoundingClientRect();
+
+    return [...found].filter(row => {
+      if (!visible(row)) return false;
+
+      if (
+        row.querySelector(
+          '[role="columnheader"], th, .ag-header-cell'
+        )
+      ) {
+        return false;
+      }
+
+      const rect = row.getBoundingClientRect();
+
+      return (
+        rect.height >= 20 &&
+        rect.height <= 150 &&
+        rect.bottom >= rootRect.top &&
+        rect.top <= rootRect.bottom
+      );
+    });
+  };
+
+  /*
+   * Get actual cells rather than nested labels/icons.
+   */
+  const getCells = row => {
+    const selector = [
+      '[role="gridcell"]',
+      '[role="cell"]',
+      ".ag-cell",
+      ".MuiDataGrid-cell",
+      "td"
+    ].join(",");
+
+    let cells = [
+      ...row.querySelectorAll(selector)
+    ].filter(visible);
+
+    if (!cells.length) {
+      cells = [...row.children].filter(child => {
+        return visible(child);
+      });
+    }
+
+    /*
+     * Remove nested duplicate cell elements.
+     */
+    return cells.filter(cell => {
+      return !cells.some(other => {
+        return (
+          other !== cell &&
+          other.contains(cell)
+        );
+      });
+    });
+  };
+
+  /*
+   * Find the row cell located directly below a heading.
+   */
+  const getCellBelowHeader = (row, header) => {
+    const cells = getCells(row);
+
+    if (!cells.length) return null;
+
+    const covering = cells.filter(cell => {
+      const rect = cell.getBoundingClientRect();
+
+      return (
+        header.x >= rect.left - 3 &&
+        header.x <= rect.right + 3
+      );
+    });
+
+    if (covering.length) {
+      return covering.sort((a, b) => {
+        const aRect = a.getBoundingClientRect();
+        const bRect = b.getBoundingClientRect();
+
+        return aRect.width - bRect.width;
+      })[0];
+    }
+
+    /*
+     * Fallback: closest horizontal cell centre.
+     */
+    return cells
+      .map(cell => {
+        const rect = cell.getBoundingClientRect();
+
+        return {
+          cell,
+          distance: Math.abs(
+            header.x -
+            (rect.left + rect.width / 2)
+          )
+        };
+      })
+      .sort((a, b) => a.distance - b.distance)[0]
+      ?.cell || null;
+  };
+
+  const getRowKey = row => {
+    const rect = row.getBoundingClientRect();
+
+    const stableIndex =
+      row.getAttribute("aria-rowindex") ||
+      row.getAttribute("row-index") ||
+      row.getAttribute("data-rowindex") ||
+      row.getAttribute("data-row-index") ||
+      row.getAttribute("data-id");
+
+    if (stableIndex) {
+      return `index:${stableIndex}`;
+    }
+
+    /*
+     * Pinned and central row sections share the same screen Y.
+     */
+    return `screen-y:${Math.round(rect.top / 3) * 3}`;
+  };
+
+  const merge = (target, source) => {
+    const result = { ...target };
+
+    for (const field of [
+      "vessel_name",
+      "imo",
+      "latitude",
+      "longitude"
+    ]) {
+      if (!result[field] && source[field]) {
+        result[field] = source[field];
+      }
+    }
+
+    return result;
+  };
+
+  const expectedMatch = clean(document.body.innerText)
+    .match(/Total Rows\s*:\s*([\d,]+)/i);
+
+  const expectedRows = expectedMatch
+    ? Number(expectedMatch[1].replace(/,/g, ""))
+    : null;
+
+  const results = new Map();
+  let order = 0;
+
+  verticalScroller.scrollTop = 0;
+  horizontalScroller.scrollLeft = 0;
+
+  await sleep(CONFIG.WAIT_MS * 2);
+
+  let previousVerticalTop = -1;
+  let noMovementCount = 0;
+
+  for (
+    let verticalPass = 1;
+    verticalPass <= CONFIG.MAX_VERTICAL_PASSES;
+    verticalPass++
+  ) {
+    const pageRows = new Map();
+
+    const maxHorizontal = Math.max(
+      0,
+      horizontalScroller.scrollWidth -
+        horizontalScroller.clientWidth
+    );
+
+    const horizontalStep = Math.max(
+      200,
+      horizontalScroller.clientWidth *
+        CONFIG.HORIZONTAL_STEP_RATIO
+    );
+
+    const horizontalPositions = [0];
+
+    for (
+      let x = horizontalStep;
+      x < maxHorizontal;
+      x += horizontalStep
+    ) {
+      horizontalPositions.push(Math.round(x));
+    }
+
+    if (
+      maxHorizontal > 0 &&
+      horizontalPositions.at(-1) !== maxHorizontal
+    ) {
+      horizontalPositions.push(maxHorizontal);
+    }
+
+    for (
+      let horizontalPass = 0;
+      horizontalPass <
+        Math.min(
+          horizontalPositions.length,
+          CONFIG.MAX_HORIZONTAL_PASSES
+        );
+      horizontalPass++
+    ) {
+      horizontalScroller.scrollLeft =
+        horizontalPositions[horizontalPass];
+
+      await sleep(CONFIG.WAIT_MS);
+
+      const headers = getHeaders();
+      const rows = getRows();
+
+      for (const row of rows) {
+        const key = getRowKey(row);
+
+        const current = pageRows.get(key) || {
+          vessel_name: "",
+          imo: "",
+          latitude: "",
+          longitude: ""
+        };
+
+        let updated = { ...current };
+
+        for (const header of headers) {
+          const cell = getCellBelowHeader(
+            row,
+            header
+          );
+
+          if (!cell) continue;
+
+          const text = clean(cell.innerText);
+
+          if (header.field === "vessel_name") {
+            const value = extractVesselName(text);
+
+            if (value) {
+              updated.vessel_name =
+                updated.vessel_name || value;
+            }
+          }
+
+          if (header.field === "imo") {
+            const value = extractIMO(text);
+
+            if (value) {
+              updated.imo =
+                updated.imo || value;
+            }
+          }
+
+          if (header.field === "latitude") {
+            const value = extractCoordinate(
+              text,
+              "latitude"
+            );
+
+            if (value !== "") {
+              updated.latitude =
+                updated.latitude || value;
+            }
+          }
+
+          if (header.field === "longitude") {
+            const value = extractCoordinate(
+              text,
+              "longitude"
+            );
+
+            if (value !== "") {
+              updated.longitude =
+                updated.longitude || value;
+            }
+          }
+        }
+
+        /*
+         * Critical IMO fallback:
+         * Search the entire rendered row for a seven-digit IMO.
+         */
+        if (!updated.imo) {
+          const rowIMO = extractIMO(row.innerText);
+
+          if (rowIMO) {
+            updated.imo = rowIMO;
+          }
+        }
+
+        pageRows.set(key, updated);
+      }
+    }
+
+    /*
+     * Merge completed horizontal scans into final results.
+     */
+    for (const row of pageRows.values()) {
+      if (!row.vessel_name && !row.imo) continue;
+
+      const globalKey = row.imo
+        ? `imo:${row.imo}`
+        : `name:${row.vessel_name.toUpperCase()}`;
+
+      const existing = results.get(globalKey);
+
+      if (!existing) {
+        results.set(globalKey, {
+          order: order++,
+          vessel_name: row.vessel_name,
+          imo: row.imo,
+          latitude: row.latitude,
+          longitude: row.longitude
+        });
+      } else {
+        results.set(
+          globalKey,
+          {
+            ...existing,
+            ...merge(existing, row)
+          }
+        );
+      }
+    }
+
+    const withIMO = [...results.values()]
+      .filter(row => row.imo).length;
+
+    const withCoordinates = [...results.values()]
+      .filter(row => {
+        return (
+          row.latitude !== "" &&
+          row.longitude !== ""
+        );
+      }).length;
+
+    console.log(
+      `Pass ${verticalPass}: ` +
+      `${results.size}` +
+      (expectedRows ? ` / ${expectedRows}` : "") +
+      ` vessels | ${withIMO} IMO | ` +
+      `${withCoordinates} coordinates`
+    );
+
+    horizontalScroller.scrollLeft = 0;
+    await sleep(CONFIG.WAIT_MS);
+
+    const currentTop =
+      verticalScroller.scrollTop;
+
+    const maxVertical = Math.max(
+      0,
+      verticalScroller.scrollHeight -
+        verticalScroller.clientHeight
+    );
+
+    if (currentTop >= maxVertical - 3) {
+      break;
+    }
+
+    const nextTop = Math.min(
+      maxVertical,
+      currentTop +
+        Math.max(
+          100,
+          verticalScroller.clientHeight *
+            CONFIG.VERTICAL_STEP_RATIO
+        )
+    );
+
+    if (
+      nextTop === currentTop ||
+      currentTop === previousVerticalTop
+    ) {
+      noMovementCount++;
+    } else {
+      noMovementCount = 0;
+    }
+
+    if (noMovementCount >= 3) {
+      break;
+    }
+
+    previousVerticalTop = currentTop;
+
+    verticalScroller.scrollTop = nextTop;
+
+    await sleep(CONFIG.WAIT_MS * 2);
+  }
+
+  /*
+   * Format and validate final records.
+   */
+  const records = [...results.values()]
+    .sort((a, b) => a.order - b.order)
+    .map(row => ({
+      "Vessel Name": row.vessel_name,
+      "IMO": row.imo,
+      "Latitude": row.latitude,
+      "Longitude": row.longitude
+    }));
+
+  if (!records.length) {
+    throw new Error(
+      "No vessel rows were collected."
+    );
+  }
+
+  const csvEscape = value =>
+    `"${String(value ?? "")
+      .replace(/"/g, '""')}"`;
+
+  const columns = [
+    "Vessel Name",
+    "IMO",
+    "Latitude",
+    "Longitude"
+  ];
+
+  const csv = [
+    columns.map(csvEscape).join(","),
+    ...records.map(row =>
+      columns
+        .map(column => csvEscape(row[column]))
+        .join(",")
+    )
+  ].join("\n");
+
+  const blob = new Blob(
+    ["\uFEFF" + csv],
+    {
+      type: "text/csv;charset=utf-8;"
+    }
+  );
+
+  const url = URL.createObjectURL(blob);
+  const anchor = document.createElement("a");
+
+  anchor.href = url;
+  anchor.download =
+    "marine_traffic_vessels_corrected.csv";
+
+  document.body.appendChild(anchor);
+  anchor.click();
+  anchor.remove();
+
+  setTimeout(
+    () => URL.revokeObjectURL(url),
+    2000
+  );
+
+  const imoCount = records.filter(
+    row => /^\d{7}$/.test(row.IMO)
+  ).length;
+
+  const coordinateCount = records.filter(
+    row =>
+      row.Latitude !== "" &&
+      row.Longitude !== ""
+  ).length;
+
+  console.table(records.slice(0, 25));
+
+  console.log(
+    `Finished: ${records.length} vessels exported.`
+  );
+
+  console.log(
+    `Valid IMO numbers: ${imoCount}`
+  );
+
+  console.log(
+    `Valid coordinate pairs: ${coordinateCount}`
+  );
+
+  if (imoCount === 0) {
+    console.warn(
+      "IMO was still not detected. Keep the IMO column visible during the first horizontal scan."
+    );
+  }
+
+  if (coordinateCount === 0) {
+    console.warn(
+      "Latitude and Longitude were not detected. Enable both through the Columns menu."
+    );
+  }
+
+  if (
+    expectedRows &&
+    records.length < expectedRows
+  ) {
+    console.warn(
+      `Page shows ${expectedRows} rows, but ` +
+      `${records.length} were exported. ` +
+      `Increase WAIT_MS to 900 and rerun.`
+    );
+  }
+})();
